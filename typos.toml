@@ -1,0 +1,23 @@
+# See https://github.com/crate-ci/typos/blob/master/docs/reference.md for how to configure the typo checker.
+
+[files]
+# Add files to this list if you don't want these files to be checked by the typo checker.
+# For e.g., `extend-exclude = [ "foo", "*.bar" ]` states that the file named "foo" and all files ends with ".bar" will be ignored by the typo checker.
+extend-exclude = ["e2e/*", "src/license/src/cert.rs", "third_party/*"]
+
+# Add word correction as key-value pairs.
+# For e.g., `"abc" = "def"` states that the word `abc` is miss spelled and its correct form is `def`.
+[default.extend-words]
+Serializeable = "Serializeable"
+"datalayer" = "datalayers"
+"aks" = "aks"
+"IIF" = "IIF"
+"rabit" = "rabit"
+"prunning" = "pruning"
+"prunned" = "pruned"
+"mosquitto" = "mosquitto"
+"typ" = "typ"
+
+[default.extend-identifiers]
+"DataLayers" = "Datalayers"
+"consts" = "consts"
