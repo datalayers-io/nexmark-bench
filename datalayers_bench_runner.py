@@ -735,50 +735,96 @@ def markdown_report(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Datalayers Nexmark benchmarks")
+    parser = argparse.ArgumentParser(
+        description="运行 Datalayers Nexmark benchmark", add_help=False
+    )
+    parser.add_argument("-h", "--help", action="help", help="显示本帮助信息并退出。")
+    parser._positionals.title = "位置参数"
+    parser._optionals.title = "可选参数"
     parser.add_argument(
         "--sql-mode",
         choices=["dlsql", "http"],
         default="dlsql",
-        help="SQL transport used to talk to Datalayers: dlsql uses the SQL port, http uses the HTTP SQL endpoint.",
+        help="连接 Datalayers 时使用的 SQL 通道：dlsql 走 SQL 端口，http 走 HTTP SQL endpoint。",
     )
     parser.add_argument(
-        "--dlsql", default=os.environ.get("DLSQL_BIN", "target/reldev/dlsql")
+        "--dlsql",
+        default=os.environ.get("DLSQL_BIN", "target/reldev/dlsql"),
+        help="dlsql 可执行文件路径，仅在 --sql-mode=dlsql 时使用。",
     )
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=19360)
+    parser.add_argument("--host", default="127.0.0.1", help="Datalayers SQL host。")
+    parser.add_argument("--port", type=int, default=19360, help="Datalayers SQL 端口。")
     parser.add_argument(
         "--http-host",
         default="127.0.0.1",
-        help="HTTP SQL host used when --sql-mode=http.",
+        help="--sql-mode=http 时使用的 HTTP SQL host。",
     )
     parser.add_argument(
         "--http-port",
         type=int,
         default=8361,
-        help="HTTP SQL port used when --sql-mode=http.",
+        help="--sql-mode=http 时使用的 HTTP SQL 端口。",
     )
-    parser.add_argument("--user", default="admin")
-    parser.add_argument("--password", default="public")
-    parser.add_argument("--kafka-brokers", default="127.0.0.1:9092")
-    parser.add_argument("--kafka-container", default="datalayers-nexmark-kafka")
-    parser.add_argument("--workdir", default=".datalayers-nexmark")
+    parser.add_argument("--user", default="admin", help="Datalayers 用户名。")
+    parser.add_argument("--password", default="public", help="Datalayers 密码。")
+    parser.add_argument(
+        "--kafka-brokers",
+        default="127.0.0.1:9092",
+        help="Datalayers source 中使用的 Kafka bootstrap servers。",
+    )
+    parser.add_argument(
+        "--kafka-container",
+        default="datalayers-nexmark-kafka",
+        help="用于管理 topic 和 preload 数据的 Kafka 容器名。",
+    )
+    parser.add_argument(
+        "--workdir",
+        default=".datalayers-nexmark",
+        help="报告、采样 CSV 和中间文件的工作目录。",
+    )
     parser.add_argument(
         "--dataset",
         required=True,
-        help="Path to the keyed JSONL dataset used for Kafka preload.",
+        help="用于 Kafka preload 的 keyed JSONL dataset 路径。",
     )
-    parser.add_argument("--partitions", type=int, default=4)
-    parser.add_argument("--queries", default="q0,q1,q2,q14,q21,q22")
+    parser.add_argument(
+        "--partitions", type=int, default=4, help="Kafka topic 分区数。"
+    )
+    parser.add_argument(
+        "--queries",
+        default="q0,q1,q2,q14,q21,q22",
+        help="逗号分隔的 query 列表。",
+    )
     parser.add_argument(
         "--sink",
         choices=[mode.value for mode in SinkMode],
         default=SinkMode.TABLE.value,
+        help="sink 类型：table 通过行数判定完成，blackhole 通过 lag 判定完成。",
     )
-    parser.add_argument("--no-cleanup", type=int, choices=[0, 1], default=0)
-    parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--engine-pid", type=int)
-    parser.add_argument("--sample-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--no-cleanup",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="设为 1 时保留 benchmark 创建的 SQL 对象。",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        help="每个 query 的完成等待超时时间，单位秒。",
+    )
+    parser.add_argument(
+        "--engine-pid",
+        type=int,
+        help="待采样的 Datalayers 进程 PID；未提供时不采样 CPU 和内存。",
+    )
+    parser.add_argument(
+        "--sample-interval",
+        type=float,
+        default=1.0,
+        help="CPU 和 RSS 采样间隔，单位秒。",
+    )
     return parser.parse_args()
 
 

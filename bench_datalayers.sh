@@ -21,47 +21,47 @@ Usage:
   bench_datalayers.sh -h HOST -P HTTP_PORT [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22]
                       [--sink table|blackhole] [--bench-root DIR]
 
-Options:
+参数:
   --datalayers-path ABS_PATH
-      Absolute path of the local Datalayers repository. When this option is used, the script
-      checks `<ABS_PATH>/target/reldev/datalayers` and `<ABS_PATH>/target/reldev/dlsql`.
-      If either binary is missing and `--skip-build` is not set, the script builds them with
-      `cargo build --profile reldev --bin datalayers --bin dlsql`.
+      本地 Datalayers 仓库的绝对路径。指定后脚本会检查
+      `<ABS_PATH>/target/reldev/datalayers` 和 `<ABS_PATH>/target/reldev/dlsql`。
+      如果二进制缺失且没有传 `--skip-build`，脚本会执行
+      `cargo build --profile reldev --bin datalayers --bin dlsql`。
 
   -h, --host HOST
-      Host address of an already running Datalayers HTTP SQL endpoint.
-      Must be specified together with `-P, --port`.
-      Cannot be used together with `--datalayers-path`.
+      已启动 Datalayers HTTP SQL endpoint 的 host 地址。
+      必须与 `-P, --port` 一起指定。
+      不能与 `--datalayers-path` 同时使用。
 
   -P, --port HTTP_PORT
-      HTTP port of an already running Datalayers instance.
-      Must be specified together with `-h, --host`.
-      Cannot be used together with `--datalayers-path`.
+      已启动 Datalayers 实例的 HTTP 端口。
+      必须与 `-h, --host` 一起指定。
+      不能与 `--datalayers-path` 同时使用。
 
   --dataset PATH
-      Keyed JSONL dataset path used for Kafka preload.
-      Default: ./nexmark_bid.keyed.jsonl
+      用于 Kafka preload 的 keyed JSONL dataset 路径。
+      默认: ./nexmark_bid.keyed.jsonl
 
   --queries LIST
-      Comma-separated query list. Supported queries: q0,q1,q2,q14,q21,q22.
+      逗号分隔的 query 列表。支持: q0,q1,q2,q14,q21,q22。
 
   --sink MODE
-      `table` waits on inserted row count in the sink table.
-      `blackhole` waits on Kafka consumer group lag reaching zero.
+      `table` 通过 sink table 的插入行数判定完成。
+      `blackhole` 通过 Kafka consumer group lag 归零判定完成。
 
   --skip-build
-      Only valid with `--datalayers-path`.
-      Do not compile Datalayers even if `target/reldev` binaries are missing.
+      仅在 `--datalayers-path` 模式下有效。
+      即使 `target/reldev` 二进制缺失，也不自动编译。
 
   --bench-root DIR
-      Temporary benchmark root directory.
+      benchmark 临时根目录。
 
   --no-cleanup
-      Only meaningful with `--datalayers-path`.
-      Keep Kafka, the temporary Datalayers process and benchmark-created SQL objects after the run.
+      仅在 `--datalayers-path` 模式下有意义。
+      运行结束后保留 Kafka、临时启动的 Datalayers 进程和 benchmark 创建的 SQL 对象。
 
   --help
-      Show this message.
+      显示本帮助信息。
 EOF
 }
 

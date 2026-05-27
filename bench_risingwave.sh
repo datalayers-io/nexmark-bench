@@ -14,6 +14,33 @@ usage() {
 Usage:
   bench_risingwave.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22] [--parallelism N] [--sink table|blackhole]
                       [--bench-root DIR] [--no-cleanup] [--image IMAGE]
+
+参数:
+  --dataset PATH
+      用于 Kafka preload 的 keyed JSONL dataset 路径。
+      默认: ./nexmark_bid.keyed.jsonl
+
+  --queries LIST
+      逗号分隔的 query 列表。支持: q0,q1,q2,q14,q21,q22。
+
+  --parallelism N
+      RisingWave `single_node` 的并行度。
+
+  --sink MODE
+      `table` 创建 materialized view，并通过行数判定完成。
+      `blackhole` 创建 blackhole sink，并通过 lag 判定完成。
+
+  --bench-root DIR
+      benchmark 临时根目录。
+
+  --no-cleanup
+      保留 Kafka、RisingWave 容器、network 和 benchmark 创建的对象。
+
+  --image IMAGE
+      覆盖默认的 RisingWave 镜像。
+
+  --help
+      显示本帮助信息。
 EOF
 }
 

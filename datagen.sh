@@ -14,14 +14,14 @@ Usage:
   datagen.sh [--dataset PATH] [--stats-output PATH] [--rows N] [--partitions N]
              [--bench-root DIR] [--no-cleanup]
 
-Options:
-  --dataset PATH       Output keyed JSONL dataset path. Default: ./nexmark_bid.keyed.jsonl
-  --stats-output PATH  Output dataset stats JSON path. Default: ./nexmark_bid.stats.json
-  --rows N             Target number of bid rows kept in the generated dataset.
-  --partitions N       Number of logical keys used when writing the keyed dataset.
-  --bench-root DIR     Temporary work root used while generating the dataset.
-  --no-cleanup         Keep the temporary Kafka container and work directory.
-  --help               Show this message.
+参数:
+  --dataset PATH       输出 keyed JSONL dataset 的路径。默认: ./nexmark_bid.keyed.jsonl
+  --stats-output PATH  输出 dataset 统计 JSON 的路径。默认: ./nexmark_bid.stats.json
+  --rows N             目标 bid 行数。
+  --partitions N       写 keyed dataset 时使用的逻辑 key 数量。
+  --bench-root DIR     生成 dataset 时使用的临时工作根目录。
+  --no-cleanup         保留临时 Kafka 容器和工作目录。
+  --help               显示本帮助信息。
 EOF
 }
 

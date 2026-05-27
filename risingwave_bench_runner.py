@@ -557,70 +557,73 @@ def markdown_report(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Run RisingWave Nexmark benchmarks against a pre-generated keyed bid JSONL dataset."
-        )
+        description="针对预先生成好的 keyed bid JSONL dataset 运行 RisingWave Nexmark benchmark。",
+        add_help=False,
     )
-    parser.add_argument("--host", default="127.0.0.1", help="RisingWave SQL host.")
-    parser.add_argument("--port", type=int, default=4566, help="RisingWave SQL port.")
-    parser.add_argument("--user", default="root", help="RisingWave SQL user.")
-    parser.add_argument("--database", default="dev", help="RisingWave database name.")
+    parser.add_argument("-h", "--help", action="help", help="显示本帮助信息并退出。")
+    parser._positionals.title = "位置参数"
+    parser._optionals.title = "可选参数"
+    parser.add_argument("--host", default="127.0.0.1", help="RisingWave SQL host。")
+    parser.add_argument("--port", type=int, default=4566, help="RisingWave SQL 端口。")
+    parser.add_argument("--user", default="root", help="RisingWave SQL 用户名。")
+    parser.add_argument("--database", default="dev", help="RisingWave 数据库名。")
     parser.add_argument(
         "--rw-container",
         default="risingwave-standalone",
-        help="Container name used for CPU and memory sampling.",
+        help="用于采样 CPU 和内存的 RisingWave 容器名。",
     )
     parser.add_argument(
         "--rw-kafka-brokers",
         default="kafka:9092",
-        help="Kafka bootstrap servers reachable from the RisingWave container.",
+        help="RisingWave 容器内可访问的 Kafka bootstrap servers。",
     )
     parser.add_argument(
         "--kafka-container",
         default="risingwave-nexmark-kafka",
-        help="Kafka container name used for topic management and preload.",
+        help="用于管理 topic 和 preload 数据的 Kafka 容器名。",
     )
     parser.add_argument(
         "--workdir",
         default=".risingwave-nexmark",
-        help="Working directory for reports and per-query sample CSV files.",
+        help="报告和每个 query 采样 CSV 的工作目录。",
     )
     parser.add_argument(
         "--dataset",
         required=True,
-        help="Path to the keyed JSONL dataset used for Kafka preload.",
+        help="用于 Kafka preload 的 keyed JSONL dataset 路径。",
     )
     parser.add_argument(
-        "--partitions", type=int, default=4, help="Kafka topic partition count."
+        "--partitions", type=int, default=4, help="Kafka topic 分区数。"
     )
     parser.add_argument(
         "--queries",
         default="q0,q1,q2,q14,q21,q22",
-        help="Comma-separated query list.",
+        help="逗号分隔的 query 列表。",
     )
     parser.add_argument(
         "--sink",
         choices=[mode.value for mode in SinkMode],
         default=SinkMode.TABLE.value,
+        help="sink 类型：table 通过行数判定完成，blackhole 通过 lag 判定完成。",
     )
     parser.add_argument(
         "--no-cleanup",
         type=int,
         choices=[0, 1],
         default=0,
-        help="Set to 1 to keep Kafka topics and RisingWave objects after the run.",
+        help="设为 1 时保留 Kafka topic 和 RisingWave 对象。",
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=600,
-        help="Per-query completion timeout in seconds.",
+        help="每个 query 的完成等待超时时间，单位秒。",
     )
     parser.add_argument(
         "--sample-interval",
         type=float,
         default=1.0,
-        help="CPU and RSS sampling interval in seconds.",
+        help="CPU 和 RSS 采样间隔，单位秒。",
     )
     return parser.parse_args()
 

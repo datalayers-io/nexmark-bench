@@ -638,57 +638,69 @@ def scan_bid_dataset(dataset_path: Path) -> dict[str, int]:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Prepare or inspect the shared Nexmark bid dataset"
+        description="生成或检查共享的 Nexmark bid dataset", add_help=False
     )
+    parser.add_argument("-h", "--help", action="help", help="显示本帮助信息并退出。")
+    parser._positionals.title = "位置参数"
+    parser._optionals.title = "可选参数"
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.title = "子命令"
 
     prepare = subparsers.add_parser(
         "prepare",
-        help="Generate a stable keyed Nexmark bid dataset from the official nexmark-flink generator",
+        help="使用官方 nexmark-flink 生成稳定命名的 keyed Nexmark bid dataset",
+        add_help=False,
     )
+    prepare.add_argument("-h", "--help", action="help", help="显示本帮助信息并退出。")
+    prepare._positionals.title = "位置参数"
+    prepare._optionals.title = "可选参数"
     prepare.add_argument(
         "--workdir",
         default=".nexmark-datagen",
-        help="Temporary work directory used while running Flink datagen.",
+        help="运行 Flink datagen 时使用的临时工作目录。",
     )
     prepare.add_argument(
         "--output",
         required=True,
-        help="Output path of the final keyed JSONL dataset.",
+        help="最终 keyed JSONL dataset 的输出路径。",
     )
     prepare.add_argument(
         "--stats-output",
         required=True,
-        help="Output path of the dataset stats JSON sidecar.",
+        help="dataset 统计 JSON 文件的输出路径。",
     )
     prepare.add_argument(
         "--kafka-container",
         required=True,
-        help="Kafka container name used during official Nexmark event generation.",
+        help="生成官方 Nexmark 事件时使用的 Kafka 容器名。",
     )
     prepare.add_argument(
         "--kafka-brokers",
         default="127.0.0.1:9092",
-        help="Kafka bootstrap servers visible to the local Flink datagen runtime.",
+        help="本地 Flink datagen 运行时可见的 Kafka bootstrap servers。",
     )
     prepare.add_argument(
         "--rows",
         type=int,
         default=DEFAULT_TARGET_BID_ROWS,
-        help="Target number of bid rows to keep in the generated dataset.",
+        help="生成后保留的目标 bid 行数。",
     )
     prepare.add_argument(
         "--partitions",
         type=int,
         default=4,
-        help="Number of logical keys used when writing the keyed JSONL output.",
+        help="写 keyed JSONL 输出时使用的逻辑 key 数量。",
     )
 
     scan = subparsers.add_parser(
         "scan",
-        help="Scan an existing keyed or plain bid dataset and print dataset stats as JSON",
+        help="扫描现有 keyed 或 plain bid dataset，并输出统计 JSON",
+        add_help=False,
     )
-    scan.add_argument("dataset", help="Path to the keyed or plain bid dataset.")
+    scan.add_argument("-h", "--help", action="help", help="显示本帮助信息并退出。")
+    scan._positionals.title = "位置参数"
+    scan._optionals.title = "可选参数"
+    scan.add_argument("dataset", help="待扫描的 keyed 或 plain bid dataset 路径。")
     return parser.parse_args()
 
 
