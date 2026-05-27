@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 
 # 这个脚本是 Datalayers Nexmark benchmark 的本地入口。
-# 它负责准备临时目录、启动 Kafka、启动 Datalayers standalone，然后把所有连接参数
-# 传给 `datalayers_bench_runner.py`。真正的 query 执行、fixture 准备、指标统计和
-# report 生成都在 Python runner 里完成。
+# 它支持两种模式：
+# 1. `--datalayers-path ABS_PATH`
+#    复用或编译本地 Datalayers 仓库的 `target/reldev/datalayers` 和 `dlsql`，临时启动一套
+#    standalone Datalayers，再跑 benchmark。
+# 2. `-h HOST -P PORT`
+#    直接连接已经启动好的 Datalayers HTTP SQL endpoint，不负责启动或清理该实例。
 
 set -euo pipefail
 
@@ -12,19 +15,70 @@ usage() {
 运行本地 Datalayers Nexmark benchmark。
 
 Usage:
-  bench_datalayers.sh --datalayers-path ABS_PATH [--rows N] [--queries q0,q1,q2,q14,q21,q22] [--sink table|blackhole]
-                     [--skip-build] [--bench-root DIR] [--no-cleanup]
+  bench_datalayers.sh --datalayers-path ABS_PATH [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22]
+                      [--sink table|blackhole] [--skip-build] [--bench-root DIR] [--no-cleanup]
+
+  bench_datalayers.sh -h HOST -P HTTP_PORT [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22]
+                      [--sink table|blackhole] [--bench-root DIR]
+
+Options:
+  --datalayers-path ABS_PATH
+      Absolute path of the local Datalayers repository. When this option is used, the script
+      checks `<ABS_PATH>/target/reldev/datalayers` and `<ABS_PATH>/target/reldev/dlsql`.
+      If either binary is missing and `--skip-build` is not set, the script builds them with
+      `cargo build --profile reldev --bin datalayers --bin dlsql`.
+
+  -h, --host HOST
+      Host address of an already running Datalayers HTTP SQL endpoint.
+      Must be specified together with `-P, --port`.
+      Cannot be used together with `--datalayers-path`.
+
+  -P, --port HTTP_PORT
+      HTTP port of an already running Datalayers instance.
+      Must be specified together with `-h, --host`.
+      Cannot be used together with `--datalayers-path`.
+
+  --dataset PATH
+      Keyed JSONL dataset path used for Kafka preload.
+      Default: ./nexmark_bid.keyed.jsonl
+
+  --queries LIST
+      Comma-separated query list. Supported queries: q0,q1,q2,q14,q21,q22.
+
+  --sink MODE
+      `table` waits on inserted row count in the sink table.
+      `blackhole` waits on Kafka consumer group lag reaching zero.
+
+  --skip-build
+      Only valid with `--datalayers-path`.
+      Do not compile Datalayers even if `target/reldev` binaries are missing.
+
+  --bench-root DIR
+      Temporary benchmark root directory.
+
+  --no-cleanup
+      Only meaningful with `--datalayers-path`.
+      Keep Kafka, the temporary Datalayers process and benchmark-created SQL objects after the run.
+
+  --help
+      Show this message.
 EOF
 }
 
 project_root="$(cd "$(dirname "$0")" && pwd)"
 cd "$project_root"
 
+RESET=$'\033[0m'
+YELLOW=$'\033[33m'
+
 log() {
 	printf '[%s UTC] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$1"
 }
 
-rows="1000000"
+log_yellow() {
+	printf '%s[%s UTC] %s%s\n' "$YELLOW" "$(date -u '+%Y-%m-%d %H:%M:%S')" "$1" "$RESET"
+}
+
 queries="q0,q1,q2,q14,q21,q22"
 sink="table"
 skip_build="0"
@@ -33,6 +87,11 @@ bench_root=""
 datalayers_path=""
 datalayers_bin=""
 dlsql_bin=""
+dataset="$project_root/nexmark_bid.keyed.jsonl"
+external_host="localhost"
+external_port="8361"
+host_set="0"
+port_set="0"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -40,8 +99,18 @@ while [[ $# -gt 0 ]]; do
 		datalayers_path="$2"
 		shift 2
 		;;
-	--rows)
-		rows="$2"
+	-h | --host)
+		external_host="$2"
+		host_set="1"
+		shift 2
+		;;
+	-P | --port)
+		external_port="$2"
+		port_set="1"
+		shift 2
+		;;
+	--dataset)
+		dataset="$2"
 		shift 2
 		;;
 	--queries)
@@ -64,7 +133,7 @@ while [[ $# -gt 0 ]]; do
 		no_cleanup="1"
 		shift
 		;;
-	-h | --help)
+	--help)
 		usage
 		exit 0
 		;;
@@ -76,22 +145,39 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-if [[ -z "$datalayers_path" ]]; then
-	echo "missing required argument: --datalayers-path" >&2
+if [[ -n "$datalayers_path" && ("$host_set" == "1" || "$port_set" == "1") ]]; then
+	echo "--datalayers-path cannot be used together with -h/--host or -P/--port" >&2
+	exit 1
+fi
+if [[ -z "$datalayers_path" && "$host_set" != "$port_set" ]]; then
+	echo "-h/--host and -P/--port must be specified together" >&2
+	exit 1
+fi
+if [[ -z "$datalayers_path" && "$host_set" == "0" ]]; then
+	echo "either --datalayers-path or (-h/--host and -P/--port) must be specified" >&2
 	usage >&2
 	exit 1
 fi
-if [[ "${datalayers_path:0:1}" != "/" ]]; then
+if [[ -n "$datalayers_path" && "${datalayers_path:0:1}" != "/" ]]; then
 	echo "--datalayers-path must be an absolute path" >&2
 	exit 1
 fi
-if [[ ! -d "$datalayers_path" ]]; then
+if [[ -n "$datalayers_path" && ! -d "$datalayers_path" ]]; then
 	echo "datalayers path does not exist: $datalayers_path" >&2
 	exit 1
 fi
-
-datalayers_bin="$datalayers_path/target/reldev/datalayers"
-dlsql_bin="$datalayers_path/target/reldev/dlsql"
+if [[ -n "$datalayers_path" ]]; then
+	datalayers_bin="$datalayers_path/target/reldev/datalayers"
+	dlsql_bin="$datalayers_path/target/reldev/dlsql"
+fi
+dataset="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$dataset")"
+if [[ ! -f "$dataset" ]]; then
+	echo "dataset does not exist: $dataset" >&2
+	exit 1
+fi
+if [[ -n "$datalayers_path" && "$host_set" == "0" && "$no_cleanup" != "0" ]]; then
+	log "No-cleanup mode enabled for locally started Datalayers"
+fi
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
@@ -131,7 +217,9 @@ cleanup_services() {
 }
 
 cleanup() {
-	cleanup_datalayers
+	if [[ -n "$datalayers_path" ]]; then
+		cleanup_datalayers
+	fi
 	cleanup_services
 }
 
@@ -164,22 +252,26 @@ ensure_port_free() {
 }
 
 prepare_workspace() {
-	# Build an isolated workspace per run so logs, config and local state do not leak across runs.
 	log "Preparing Datalayers benchmark workspace at $work_dir"
-	cleanup_datalayers
+	if [[ -n "$datalayers_path" ]]; then
+		cleanup_datalayers
+	fi
 	cleanup_services
 	rm -rf "$work_dir"
 	mkdir -p "$work_dir" "$base_dir"
-	cp "$datalayers_path/.github/e2e-config/e2e-standalone-config.toml" "$config"
-	escaped_base_dir="${base_dir//\//\\/}"
-	sed -i \
-		-e "s#^base_dir = .*#base_dir = \"$escaped_base_dir\"#" \
-		-e "s#path = \"/var/lib/datalayers/wal\"#path = \"$escaped_base_dir/wal\"#" \
-		-e "s#^addr = \"127.0.0.1:19360\"#addr = \"127.0.0.1:${datalayers_port}\"#" \
-		-e "s#^http = \"127.0.0.1:19361\"#http = \"127.0.0.1:${datalayers_http_port}\"#" \
-		-e "s#^addr = \"0.0.0.0:9090\"#addr = \"127.0.0.1:${datalayers_prom_port}\"#" \
-		-e "s#^addr = \"0.0.0.0:5432\"#addr = \"127.0.0.1:${datalayers_pg_port}\"#" \
-		"$config"
+	if [[ -n "$datalayers_path" ]]; then
+		cp "$datalayers_path/.github/e2e-config/e2e-standalone-config.toml" "$config"
+		escaped_base_dir="${base_dir//\//\\/}"
+		sed -i \
+			-e "s#^base_dir = .*#base_dir = \"$escaped_base_dir\"#" \
+			-e "s#path = \"/var/lib/datalayers/wal\"#path = \"$escaped_base_dir/wal\"#" \
+			-e "s#^addr = \"127.0.0.1:19360\"#addr = \"127.0.0.1:${datalayers_port}\"#" \
+			-e "s#^http = \"127.0.0.1:19361\"#http = \"127.0.0.1:${datalayers_http_port}\"#" \
+			-e "s#^addr = \"0.0.0.0:9090\"#addr = \"127.0.0.1:${datalayers_prom_port}\"#" \
+			-e "s#^addr = \"0.0.0.0:5432\"#addr = \"127.0.0.1:${datalayers_pg_port}\"#" \
+			"$config"
+		log_yellow "Using Datalayers config file: $config"
+	fi
 }
 
 build_binaries() {
@@ -200,7 +292,6 @@ build_binaries() {
 }
 
 start_kafka() {
-	# Kafka is created per benchmark run because the replay harness relies on clean topics.
 	log "Starting Kafka container $kafka_container on host port $kafka_host_port"
 	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
 	docker run -d --name "$kafka_container" \
@@ -235,42 +326,65 @@ start_kafka() {
 }
 
 start_datalayers() {
-	# The Python runner samples this process directly, so we keep its pid for later use.
-	log "Starting Datalayers on port $datalayers_port"
+	log "Starting Datalayers on SQL port $datalayers_port and HTTP port $datalayers_http_port"
 	"$datalayers_bin" standalone -c "$config" >"$log_file" 2>&1 &
 	echo "$!" >"$pid_file"
-	wait_for_port 127.0.0.1 "$datalayers_port" datalayers
-	log "Datalayers is ready on port $datalayers_port"
+	wait_for_port 127.0.0.1 "$datalayers_port" datalayers-sql
+	wait_for_port 127.0.0.1 "$datalayers_http_port" datalayers-http
+	log "Datalayers is ready"
 }
 
-run_bench() {
-	# The Python runner performs fixture preparation, per-query replay and metric aggregation.
-	log "Running Datalayers Nexmark benchmark: rows=$rows queries=$queries sink=$sink"
+run_bench_local() {
+	log "Running Datalayers Nexmark benchmark against local process: dataset=$dataset queries=$queries sink=$sink"
 	python3 ./datalayers_bench_runner.py \
+		--sql-mode dlsql \
 		--dlsql "$dlsql_bin" \
 		--host 127.0.0.1 \
 		--port "$datalayers_port" \
 		--kafka-brokers "127.0.0.1:${kafka_host_port}" \
 		--kafka-container "$kafka_container" \
 		--workdir "$work_dir" \
-		--rows "$rows" \
+		--dataset "$dataset" \
 		--queries "$queries" \
 		--sink "$sink" \
 		--no-cleanup "$no_cleanup" \
 		--engine-pid "$(cat "$pid_file")"
-	log "Datalayers Nexmark benchmark finished"
 }
 
-datalayers_port="$(ensure_port_free 19360 19460)"
-datalayers_http_port="$(ensure_port_free 19461 19561)"
-datalayers_prom_port="$(ensure_port_free 19562 19662)"
-datalayers_pg_port="$(ensure_port_free 19663 19763)"
+run_bench_remote() {
+	log "Running Datalayers Nexmark benchmark against existing HTTP endpoint: host=$external_host port=$external_port dataset=$dataset queries=$queries sink=$sink"
+	no_cleanup="1"
+	python3 ./datalayers_bench_runner.py \
+		--sql-mode http \
+		--http-host "$external_host" \
+		--http-port "$external_port" \
+		--kafka-brokers "127.0.0.1:${kafka_host_port}" \
+		--kafka-container "$kafka_container" \
+		--workdir "$work_dir" \
+		--dataset "$dataset" \
+		--queries "$queries" \
+		--sink "$sink" \
+		--no-cleanup 1
+}
+
+if [[ -n "$datalayers_path" ]]; then
+	datalayers_port="$(ensure_port_free 19360 19460)"
+	datalayers_http_port="$(ensure_port_free 19461 19561)"
+	datalayers_prom_port="$(ensure_port_free 19562 19662)"
+	datalayers_pg_port="$(ensure_port_free 19663 19763)"
+fi
 kafka_host_port="$(ensure_port_free 9092 9192)"
 prepare_workspace
-build_binaries
+if [[ -n "$datalayers_path" ]]; then
+	build_binaries
+fi
 start_kafka
-start_datalayers
-run_bench
+if [[ -n "$datalayers_path" ]]; then
+	start_datalayers
+	run_bench_local
+else
+	run_bench_remote
+fi
 
 echo "report: $work_dir/report.md"
 echo "json:   $work_dir/report.json"

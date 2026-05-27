@@ -2,16 +2,16 @@
 """
 这个 bench runner 用来在本地 standalone Flink 上运行一组固定的 Nexmark 风格查询。
 
-和另外两个 runner 一样，它不会直接使用手工造数，而是通过 `nexmark_fixture.py`
-准备官方 Nexmark 派生的 bid fixture。当前 Flink runner 固定使用 blackhole sink。
+和另外两个 runner 一样，它不会直接使用手工造数，而是消费一个已经预先准备好的
+keyed bid JSONL dataset。当前 Flink runner 固定使用 blackhole sink。
 
 执行方式：
 
 1. `bench_flink.sh` 启动 Kafka，并把 Kafka 地址和工作目录传入本文件。
-2. 本文件准备 Flink toolchain，准备官方 bid fixture，并为 Kafka 生成 preload 文件。
+2. 本文件准备 Flink toolchain，扫描现有 dataset，并计算输入行数和几个 query 的理论输出行数。
 3. 对每个 query：
    - 重建独立的 Kafka topic
-   - preload 输入数据
+   - 把 keyed dataset preload 到 topic
    - 启动本地 Flink standalone cluster
    - 创建 source/sink table 并提交 insert job
    - 在 replay 窗口内采样 Flink 相关 Java 进程的 CPU 和 RSS
@@ -56,7 +56,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from nexmark_fixture import prepare_flink_toolchain, prepare_official_bid_fixture
+from nexmark_fixture import prepare_flink_toolchain, scan_bid_dataset
 
 
 RESET = "\033[0m"
@@ -455,20 +455,6 @@ def parse_job_id(output: str) -> str:
     return match.group(1)
 
 
-def rewrite_dataset_with_keys(
-    dataset_path: Path, keyed_path: Path, partitions: int
-) -> None:
-    # The keyed preload file gives stable partition assignment across repeated measurements.
-    log(f"Rewriting dataset with Kafka keys into {keyed_path}")
-    with (
-        dataset_path.open("r", encoding="utf-8") as src,
-        keyed_path.open("w", encoding="utf-8") as dst,
-    ):
-        for index, line in enumerate(src):
-            dst.write(f"p{index % partitions}\t{line}")
-    log(f"Finished keyed dataset rewrite for {partitions} partitions")
-
-
 def kafka_group_lag(container: str, group: str, topic: str) -> int | None:
     result = subprocess.run(
         [
@@ -515,32 +501,6 @@ def wait_for_group_lag_zero(
     raise BenchError(
         f"timeout waiting for kafka group {group} lag to reach 0 on topic {topic}"
     )
-
-
-def prepare_fixture(
-    *,
-    workdir: Path,
-    dataset_name: str,
-    rows: int,
-    kafka_container: str,
-    kafka_brokers: str,
-    partitions: int,
-) -> tuple[Path, Path, dict[str, int], dict[str, object]]:
-    # Flink uses the same official bid fixture as the other runners so the only variable is the
-    # execution engine.
-    result = prepare_official_bid_fixture(
-        workdir=workdir,
-        kafka_container=kafka_container,
-        kafka_brokers=kafka_brokers,
-        rows=rows,
-        partitions=partitions,
-        log=log,
-    )
-    dataset_path = workdir / dataset_name
-    keyed_path = workdir / f"{dataset_path.stem}.keyed{dataset_path.suffix}"
-    shutil.copy2(result.dataset_path, dataset_path)
-    rewrite_dataset_with_keys(dataset_path, keyed_path, partitions)
-    return dataset_path, keyed_path, result.stats, result.metadata
 
 
 def create_runtime(workdir: Path) -> tuple[Path, Path, int]:
@@ -637,9 +597,10 @@ def markdown_report(
         "",
         f"- Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"- Kafka brokers: `127.0.0.1:{args.kafka_port}`",
-        f"- Fixture: `official`",
+        f"- Fixture: `official keyed bid dataset`",
         f"- Sink mode: `blackhole`",
         f"- Input rows: `{dataset_stats['total_rows']}`",
+        f"- Dataset path: `{Path(args.dataset).resolve()}`",
         "",
         "| Query | Input Rows | Expected Rows | Replay Seconds | Throughput (input records/s) | Avg CPU (%) | Avg Mem (GiB) | Kafka Preload Seconds | Final State |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -654,23 +615,57 @@ def markdown_report(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Flink Nexmark benchmarks")
-    parser.add_argument("--workdir", default=".flink-nexmark")
-    parser.add_argument("--dataset-name", default="nexmark_bid.jsonl")
-    parser.add_argument("--rows", type=int, default=1_000_000)
-    parser.add_argument("--partitions", type=int, default=4)
-    parser.add_argument("--queries", default="q0,q1,q2,q14,q21,q22")
-    parser.add_argument("--kafka-container", required=True)
-    parser.add_argument("--kafka-port", type=int, default=9092)
-    parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--sample-interval", type=float, default=1.0)
+    parser = argparse.ArgumentParser(
+        description="Run Flink Nexmark benchmarks against a pre-generated keyed bid JSONL dataset."
+    )
+    parser.add_argument(
+        "--workdir",
+        default=".flink-nexmark",
+        help="Working directory for reports, SQL files, and the temporary Flink runtime.",
+    )
+    parser.add_argument(
+        "--dataset",
+        required=True,
+        help="Path to the keyed JSONL dataset used for Kafka preload.",
+    )
+    parser.add_argument(
+        "--partitions", type=int, default=4, help="Kafka topic partition count."
+    )
+    parser.add_argument(
+        "--queries",
+        default="q0,q1,q2,q14,q21,q22",
+        help="Comma-separated query list.",
+    )
+    parser.add_argument(
+        "--kafka-container",
+        required=True,
+        help="Kafka container name used for topic management and preload.",
+    )
+    parser.add_argument(
+        "--kafka-port",
+        type=int,
+        default=9092,
+        help="Kafka port exposed on the host for the local Flink runtime.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        help="Per-query completion timeout in seconds.",
+    )
+    parser.add_argument(
+        "--sample-interval",
+        type=float,
+        default=1.0,
+        help="CPU and RSS sampling interval in seconds.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     log(
-        f"Starting Flink Nexmark benchmark: rows={args.rows} queries={args.queries} workdir={args.workdir}"
+        f"Starting Flink Nexmark benchmark: dataset={args.dataset} queries={args.queries} workdir={args.workdir}"
     )
     workdir = Path(args.workdir).resolve()
     report_md = workdir / "report.md"
@@ -684,14 +679,9 @@ def main() -> int:
             raise BenchError(f"unsupported query: {name}")
         queries.append(spec)
 
-    _dataset_path, keyed_path, dataset_stats, fixture_metadata = prepare_fixture(
-        workdir=workdir,
-        dataset_name=args.dataset_name,
-        rows=args.rows,
-        kafka_container=args.kafka_container,
-        kafka_brokers=f"127.0.0.1:{args.kafka_port}",
-        partitions=args.partitions,
-    )
+    dataset_path = Path(args.dataset).resolve()
+    dataset_stats = scan_bid_dataset(dataset_path)
+    fixture_metadata = {"dataset_path": str(dataset_path)}
     runtime_flink, _runtime_nexmark, rest_port = create_runtime(workdir)
     env = dict(os.environ)
     env["FLINK_HOME"] = str(runtime_flink)
@@ -711,7 +701,7 @@ def main() -> int:
             log(f"Starting benchmark for query {query.name}", color=GREEN)
             topic = f"nexmark_{query.name}"
             ensure_topic(args.kafka_container, topic, args.partitions)
-            kafka_preload_sec = load_topic(args.kafka_container, topic, keyed_path)
+            kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
             sql_file = workdir / f"{query.name}.sql"
             sql_file.write_text(render_sql(topic, query), encoding="utf-8")
             sample_csv = workdir / f"{query.name}_samples.csv"
@@ -771,7 +761,8 @@ def main() -> int:
                 {
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                     "engine": "flink",
-                    "fixture": "official",
+                    "mode": "preload_then_earliest_replay",
+                    "fixture": "official keyed bid dataset",
                     "fixture_metadata": fixture_metadata,
                     "dataset_stats": dataset_stats,
                     "sink_mode": "blackhole",

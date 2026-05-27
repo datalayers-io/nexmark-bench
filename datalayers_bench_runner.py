@@ -2,19 +2,17 @@
 """
 这个 bench runner 用来在本地 Datalayers 实例上运行一组固定的 Nexmark 风格基准查询。
 
-它并不直接消费完整的 Nexmark `Person/Auction/Bid` 联合事件流，而是先复用
-`nexmark_fixture.py` 中的适配逻辑，从官方 Nexmark 生成器产生的 combined events
-中抽取 `Bid` 事件，再把这些 bid 事件扁平化成当前 Datalayers benchmark 可直接消费
-的 JSON fixture。
+它消费的是一个已经预先准备好的 keyed bid JSONL dataset。这个 dataset 通常由
+`datagen.sh` 调用 `nexmark_fixture.py` 生成，并稳定保存在 `nexmark-bench` 目录下。
 
 执行方式：
 
 1. `bench_datalayers.sh` 负责启动 Kafka、本地 Datalayers 进程，并把连接参数传入本文件。
-2. 本文件先准备官方 bid fixture，并为 Kafka 生成按 partition 打 key 的 preload 文件。
+2. 本文件扫描现有 dataset，计算输入行数和几个 query 的理论输出行数。
 3. 对每个 query：
    - 重建独立的 Kafka topic
    - 在 Datalayers 中创建 database/source/sink/pipeline
-   - 把 fixture preload 到 topic
+   - 把 keyed dataset preload 到 topic
    - 从 source 的 `offset='earliest'` 开始回放
    - 在 replay 窗口内采样 Datalayers 进程的 CPU 和 RSS
    - 根据 sink 类型等待 query 完成
@@ -30,7 +28,7 @@
 - `replay_sec`
   指从创建 source/pipeline 并开始 replay，到完成判定满足为止的耗时。
 - `throughput_rps`
-  定义为 `input_rows / replay_sec`，分母只包含 replay 窗口，不包含 fixture 下载或 Kafka preload。
+  定义为 `input_rows / replay_sec`，分母只包含 replay 窗口，不包含 dataset 生成或 Kafka preload。
 - `avg_cpu_percent`
   replay 窗口内，对 Datalayers 进程做周期性 `ps` 采样后取平均值。
 - `avg_mem_gib`
@@ -61,7 +59,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-from nexmark_fixture import prepare_official_bid_fixture
+import base64
+import urllib.parse
+import urllib.request
+
+from nexmark_fixture import scan_bid_dataset
 
 
 RESET = "\033[0m"
@@ -280,6 +282,52 @@ class DatalayersSql:
         raise BenchError(f"cannot parse scalar result from output: {output}")
 
 
+class DatalayersHttpSql:
+    def __init__(self, host: str, port: int, user: str, password: str):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+
+    def run(self, sql: str, database: str | None = None, timeout: int = 60) -> str:
+        query = {}
+        if database:
+            query["db"] = database
+        url = f"http://{self.host}:{self.port}/api/v1/sql"
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        auth = base64.b64encode(f"{self.user}:{self.password}".encode("utf-8")).decode(
+            "ascii"
+        )
+        request = urllib.request.Request(
+            url=url,
+            method="POST",
+            data=sql.encode("utf-8"),
+            headers={
+                "Authorization": f"Basic {auth}",
+                "Content-Type": "text/plain; charset=utf-8",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read().decode("utf-8")
+        except Exception as exc:
+            raise BenchError(f"http sql request failed: {exc}") from exc
+
+    def scalar_i64(self, sql: str, database: str) -> int:
+        payload = json.loads(self.run(sql, database=database))
+        if "affected_rows" in payload:
+            return int(payload["affected_rows"])
+        values = payload.get("result", {}).get("values", [])
+        if values and values[0]:
+            value = values[0][0]
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+        raise BenchError(f"cannot parse scalar result from http output: {payload}")
+
+
 class ProcessMonitor:
     def __init__(self, pid: int, output_csv: Path, sample_interval: float):
         self.pid = pid
@@ -339,32 +387,6 @@ def summarize_samples(path: Path) -> tuple[float, float]:
     avg_cpu = sum(cpu_values) / len(cpu_values)
     avg_mem_gib = (sum(rss_values) / len(rss_values)) / 1024 / 1024
     return avg_cpu, avg_mem_gib
-
-
-def prepare_fixture(
-    *,
-    workdir: Path,
-    dataset_name: str,
-    rows: int,
-    kafka_container: str,
-    kafka_brokers: str,
-    partitions: int,
-) -> tuple[Path, Path, dict[str, int], dict[str, object]]:
-    # Build a local bid-only fixture from the shared official Nexmark input so every engine
-    # runner replays the same rows.
-    dataset_path = workdir / dataset_name
-    keyed_path = workdir / f"{dataset_path.stem}.keyed{dataset_path.suffix}"
-    result = prepare_official_bid_fixture(
-        workdir=workdir,
-        kafka_container=kafka_container,
-        kafka_brokers=kafka_brokers,
-        rows=rows,
-        partitions=partitions,
-        log=log,
-    )
-    shutil.copy2(result.dataset_path, dataset_path)
-    rewrite_dataset_with_keys(dataset_path, keyed_path, partitions)
-    return dataset_path, keyed_path, result.stats, result.metadata
 
 
 def run_cmd(cmd: list[str], input_path: Path | None = None, timeout: int = 300) -> None:
@@ -453,21 +475,6 @@ def load_topic(container: str, topic: str, dataset_path: Path) -> float:
     elapsed = time.time() - start
     log(f"Finished Kafka preload for topic {topic} in {elapsed:.3f}s")
     return elapsed
-
-
-def rewrite_dataset_with_keys(
-    dataset_path: Path, keyed_path: Path, partitions: int
-) -> None:
-    # The preload path uses kafka-console-producer with parse.key enabled, so every row gets a
-    # deterministic partition key before being written into Kafka.
-    log(f"Rewriting dataset with Kafka keys into {keyed_path}")
-    with (
-        dataset_path.open("r", encoding="utf-8") as src,
-        keyed_path.open("w", encoding="utf-8") as dst,
-    ):
-        for index, line in enumerate(src):
-            dst.write(f"p{index % partitions}\t{line}")
-    log(f"Finished keyed dataset rewrite for {partitions} partitions")
 
 
 def wait_for_count(
@@ -683,10 +690,10 @@ def markdown_report(
         f"- Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"- Kafka brokers: `{args.kafka_brokers}`",
         f"- Topic partitions: `{args.partitions}`",
-        f"- Fixture: `official`",
+        f"- Fixture: `official keyed bid dataset`",
         f"- Sink mode: `{args.sink}`",
         f"- Input rows: `{dataset_stats['total_rows']}`",
-        f"- Dataset: bid events extracted from official Nexmark combined events",
+        f"- Dataset path: `{Path(args.dataset).resolve()}`",
         f"- Measurement mode: preload Kafka then replay from `earliest`",
         "",
         "## Dataset",
@@ -703,12 +710,12 @@ def markdown_report(
         "",
         "## Results",
         "",
-        "| Query | Input Rows | Expected Rows | Actual Rows | Replay Seconds | Throughput (input records/s) | Avg CPU (%) | Avg Mem (GiB) | Kafka Preload Seconds | State |",
+        "| Query | Input Rows | Expected Rows | Inserted Rows | Replay Seconds | Throughput (input records/s) | Avg CPU (%) | Avg Mem (GiB) | Kafka Preload Seconds | State |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for item in results:
         lines.append(
-            "| {query} | {input_rows} | {expected_rows} | {actual_rows} | {replay_sec:.3f} | {throughput_rps:.1f} | {avg_cpu_percent:.2f} | {avg_mem_gib:.3f} | {kafka_preload_sec:.3f} | {state} |".format(
+            "| {query} | {input_rows} | {expected_rows} | {inserted_rows} | {replay_sec:.3f} | {throughput_rps:.1f} | {avg_cpu_percent:.2f} | {avg_mem_gib:.3f} | {kafka_preload_sec:.3f} | {state} |".format(
                 **item
             )
         )
@@ -730,17 +737,37 @@ def markdown_report(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Datalayers Nexmark benchmarks")
     parser.add_argument(
+        "--sql-mode",
+        choices=["dlsql", "http"],
+        default="dlsql",
+        help="SQL transport used to talk to Datalayers: dlsql uses the SQL port, http uses the HTTP SQL endpoint.",
+    )
+    parser.add_argument(
         "--dlsql", default=os.environ.get("DLSQL_BIN", "target/reldev/dlsql")
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=19360)
+    parser.add_argument(
+        "--http-host",
+        default="127.0.0.1",
+        help="HTTP SQL host used when --sql-mode=http.",
+    )
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        default=8361,
+        help="HTTP SQL port used when --sql-mode=http.",
+    )
     parser.add_argument("--user", default="admin")
     parser.add_argument("--password", default="public")
     parser.add_argument("--kafka-brokers", default="127.0.0.1:9092")
     parser.add_argument("--kafka-container", default="datalayers-nexmark-kafka")
     parser.add_argument("--workdir", default=".datalayers-nexmark")
-    parser.add_argument("--dataset-name", default="nexmark_bid.jsonl")
-    parser.add_argument("--rows", type=int, default=1_000_000)
+    parser.add_argument(
+        "--dataset",
+        required=True,
+        help="Path to the keyed JSONL dataset used for Kafka preload.",
+    )
     parser.add_argument("--partitions", type=int, default=4)
     parser.add_argument("--queries", default="q0,q1,q2,q14,q21,q22")
     parser.add_argument(
@@ -750,8 +777,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-cleanup", type=int, choices=[0, 1], default=0)
     parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--keep-data", action="store_true")
-    parser.add_argument("--engine-pid", type=int, required=True)
+    parser.add_argument("--engine-pid", type=int)
     parser.add_argument("--sample-interval", type=float, default=1.0)
     return parser.parse_args()
 
@@ -759,8 +785,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     log(
-        f"Starting Datalayers Nexmark benchmark: rows={args.rows} queries={args.queries} "
-        f"sink={args.sink} workdir={args.workdir}"
+        f"Starting Datalayers Nexmark benchmark: dataset={args.dataset} queries={args.queries} "
+        f"sink={args.sink} sql_mode={args.sql_mode} workdir={args.workdir}"
     )
     workdir = Path(args.workdir).resolve()
     report_md = workdir / "report.md"
@@ -782,17 +808,19 @@ def main() -> int:
         )
     sink_mode = SinkMode(args.sink)
 
-    sql = DatalayersSql(args.dlsql, args.host, args.port, args.user, args.password)
+    if args.sql_mode == "dlsql":
+        sql: DatalayersSql | DatalayersHttpSql = DatalayersSql(
+            args.dlsql, args.host, args.port, args.user, args.password
+        )
+    else:
+        sql = DatalayersHttpSql(
+            args.http_host, args.http_port, args.user, args.password
+        )
     workdir.mkdir(parents=True, exist_ok=True)
 
-    dataset_path, keyed_path, dataset_stats, fixture_metadata = prepare_fixture(
-        workdir=workdir,
-        dataset_name=args.dataset_name,
-        rows=args.rows,
-        kafka_container=args.kafka_container,
-        kafka_brokers=args.kafka_brokers,
-        partitions=args.partitions,
-    )
+    dataset_path = Path(args.dataset).resolve()
+    dataset_stats = scan_bid_dataset(dataset_path)
+    fixture_metadata = {"dataset_path": str(dataset_path)}
 
     results: list[dict[str, object]] = []
     for query in queries:
@@ -809,37 +837,46 @@ def main() -> int:
                 sink = create_table_sink(sql, database, query)
             else:
                 sink = create_blackhole_sink(sql, database, query)
-            kafka_preload_sec = load_topic(args.kafka_container, topic, keyed_path)
+            kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
             expected_rows = query.expected_rows(dataset_stats)
             sample_csv = workdir / f"{query.name}_samples.csv"
-            monitor = ProcessMonitor(args.engine_pid, sample_csv, args.sample_interval)
+            monitor = (
+                ProcessMonitor(args.engine_pid, sample_csv, args.sample_interval)
+                if args.engine_pid is not None
+                else None
+            )
             replay_t0 = time.time()
             log(f"Starting replay window for query {query.name}")
-            monitor.start()
+            if monitor is not None:
+                monitor.start()
             try:
                 # The replay window intentionally includes source and pipeline creation.
                 source, pipeline = create_source_and_pipeline(
                     sql, database, topic, args.kafka_brokers, query, sink
                 )
                 if sink_mode == SinkMode.TABLE:
-                    actual_rows, _ = wait_for_count(
+                    inserted_rows, _ = wait_for_count(
                         sql, database, sink, expected_rows, args.timeout
                     )
                 else:
                     current_pipeline_id = pipeline_id(sql, database, pipeline)
                     group = f"datalayers-{current_pipeline_id}-group"
-                    actual_rows, _ = wait_for_group_lag_zero(
+                    inserted_rows, _ = wait_for_group_lag_zero(
                         args.kafka_container, group, topic, args.timeout
                     )
-                    actual_rows = expected_rows
+                    inserted_rows = expected_rows
             finally:
-                monitor.stop()
+                if monitor is not None:
+                    monitor.stop()
             replay_t1 = time.time()
             replay_sec = replay_t1 - replay_t0
-            avg_cpu_percent, avg_mem_gib = summarize_samples(sample_csv)
+            if monitor is not None:
+                avg_cpu_percent, avg_mem_gib = summarize_samples(sample_csv)
+            else:
+                avg_cpu_percent, avg_mem_gib = 0.0, 0.0
             state = pipeline_state(sql, database, pipeline)
             log(
-                f"Finished benchmark for query {query.name}: actual_rows={actual_rows} "
+                f"Finished benchmark for query {query.name}: inserted_rows={inserted_rows} "
                 f"replay_sec={replay_sec:.3f} throughput={dataset_stats['total_rows'] / replay_sec if replay_sec > 0 else 0.0:.1f}",
                 color=GREEN,
             )
@@ -848,7 +885,7 @@ def main() -> int:
                     "query": query.name,
                     "input_rows": dataset_stats["total_rows"],
                     "expected_rows": expected_rows,
-                    "actual_rows": actual_rows,
+                    "inserted_rows": inserted_rows,
                     "replay_sec": round(replay_sec, 3),
                     "throughput_rps": round(dataset_stats["total_rows"] / replay_sec, 1)
                     if replay_sec > 0
@@ -876,10 +913,12 @@ def main() -> int:
     report_json.write_text(
         json.dumps(
             {
-                "fixture": "official",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "engine": "datalayers",
+                "mode": "preload_then_earliest_replay",
+                "fixture": "official keyed bid dataset",
                 "fixture_metadata": fixture_metadata,
-                "dataset": dataset_stats,
-                "queries": requested_queries,
+                "dataset_stats": dataset_stats,
                 "sink_mode": sink_mode.value,
                 "results": results,
             },
@@ -888,10 +927,6 @@ def main() -> int:
         + "\n",
         encoding="utf-8",
     )
-
-    if not args.keep_data:
-        dataset_path.unlink(missing_ok=True)
-        keyed_path.unlink(missing_ok=True)
 
     log(f"Benchmark completed, report written to {report_md}")
     if args.no_cleanup:

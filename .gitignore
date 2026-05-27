@@ -45,3 +45,4 @@ tools/dlsql/static/
 # Python generated files.
 __pycache__
 *.pyc
+.ruff_cache/

@@ -1,41 +1,46 @@
-# Nexmark Benchmark
+# Nexmark Bench
 
-这个目录包含 Datalayers、RisingWave、Flink 的 Nexmark benchmark 脚本。
+这个目录包含 Datalayers、RisingWave、Flink 的本地 Nexmark benchmark harness。
 
 ## 当前设计
 
-- 唯一支持的 fixture 是官方 Nexmark 生成器。
-- benchmark 先用官方 `nexmark-flink` datagen 生成 combined Nexmark events 到 Kafka topic `nexmark`。
-- 再从 combined event 中抽取 `bid` 事件，扁平化为本地 `jsonl` fixture。
-- benchmark 期间把这份 bid fixture preload 到 query topic，再从 `earliest` 回放。
+- benchmark 只消费一个已经预先生成好的 keyed bid JSONL dataset。
+- dataset 由 [datagen.sh](/home/nsc/nexmark-bench/datagen.sh:1) 调用 [nexmark_fixture.py](/home/nsc/nexmark-bench/nexmark_fixture.py:1) 生成。
+- `nexmark_fixture.py` 会使用官方 `nexmark-flink` datagen 生成 combined Nexmark events，然后抽取 `Bid` 事件。
+- 抽取出的 bid 会被扁平化，并写入稳定命名的 keyed JSONL 文件，默认是 [nexmark_bid.keyed.jsonl](/home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl)。
+- benchmark 脚本不再在运行时临时生成 fixture。它们只接收 `--dataset`，默认指向仓库根目录下的稳定 dataset 文件。
 - 当前默认 query 是 `q0,q1,q2,q14,q21,q22`。
-- 当前默认输入行数是 `1000000`。
-- `throughput = 输入行数 / replay 耗时`。
+- 当前 throughput 统一定义为 `input_rows / replay_sec`。
 
-这套 benchmark 当前衡量的是：
+## 数据生成
 
-- preload 完成后，从 source/query 创建开始，到回放完成为止的 replay 窗口
-- replay 窗口内的平均 CPU 与内存采样
+先生成可复用 dataset：
 
-这套 benchmark 当前不再支持手工 `synthetic` fixture。
+```bash
+bash ./datagen.sh
+```
 
-## 输入数据
+默认输出：
 
-benchmark 消费的 topic message 是扁平化后的 bid JSON，不是完整的 Nexmark union event。
+- dataset: [nexmark_bid.keyed.jsonl](/home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl)
+- stats: [nexmark_bid.stats.json](/home/nsc/nexmark-bench/nexmark_bid.stats.json)
 
-这份 bid fixture 来自官方 combined Nexmark events 的抽取，而不是手工构造。
+可选参数：
 
-字段：
+- `--dataset PATH`
+  指定输出 keyed JSONL 文件路径。
+- `--stats-output PATH`
+  指定输出 stats JSON 文件路径。
+- `--rows N`
+  目标 bid 行数。`nexmark-flink` 先生成足够多的 combined events，再从中截取前 `N` 条 bid。
+- `--partitions N`
+  写 keyed dataset 时使用的逻辑 key 数量。默认 `4`。
+- `--bench-root DIR`
+  datagen 临时工作目录根路径。
+- `--no-cleanup`
+  保留 datagen 临时 Kafka 容器和工作目录，便于排查。
 
-- `ts`
-- `auction`
-- `bidder`
-- `price`
-- `channel`
-- `url`
-- `extra`
-
-## 入口脚本
+## Benchmark 入口
 
 - [bench_datalayers.sh](/home/nsc/nexmark-bench/bench_datalayers.sh:1)
 - [bench_risingwave.sh](/home/nsc/nexmark-bench/bench_risingwave.sh:1)
@@ -50,252 +55,186 @@ benchmark 消费的 topic message 是扁平化后的 bid JSON，不是完整的 
 
 ## 推荐用法
 
-Datalayers:
+先生成 dataset：
+
+```bash
+bash ./datagen.sh
+```
+
+跑 Datalayers：
 
 ```bash
 bash ./bench_datalayers.sh \
   --datalayers-path /home/nsc/datalayers \
-  --rows 1000000 \
+  --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
   --queries q0,q1,q2,q14,q21,q22 \
   --sink table
 ```
 
-RisingWave:
+或者连接已经启动的 Datalayers：
+
+```bash
+bash ./bench_datalayers.sh \
+  -h localhost \
+  -P 8361 \
+  --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
+  --queries q0,q1,q2,q14,q21,q22 \
+  --sink table
+```
+
+跑 RisingWave：
 
 ```bash
 bash ./bench_risingwave.sh \
-  --rows 1000000 \
+  --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
   --queries q0,q1,q2,q14,q21,q22 \
   --parallelism 1 \
   --sink table
 ```
 
-Flink:
+跑 Flink：
 
 ```bash
 bash ./bench_flink.sh \
-  --rows 1000000 \
+  --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
   --queries q0,q1,q2,q14,q21,q22
 ```
 
-## 参数
+## 脚本参数
 
 ### `bench_datalayers.sh`
 
-支持：
+两种运行模式：
+
+- 本地仓库模式：`--datalayers-path ABS_PATH`
+- 外部实例模式：`-h HOST -P HTTP_PORT`
+
+约束：
+
+- `--datalayers-path` 与 `-h/-P` 互斥。
+- `-h` 和 `-P` 必须同时指定。
+- 本地仓库模式下，脚本会检查 `<ABS_PATH>/target/reldev/datalayers` 和 `<ABS_PATH>/target/reldev/dlsql`。
+- 若编译产物不存在且未传 `--skip-build`，脚本会自动执行 `cargo build --profile reldev --bin datalayers --bin dlsql`。
+- 外部实例模式不会启动或清理 Datalayers，只通过 HTTP SQL endpoint 执行 benchmark。
+
+主要参数：
 
 - `--datalayers-path ABS_PATH`
-- `--rows`
-- `--queries`
-- `--sink`
+  本地 Datalayers 仓库的绝对路径。
+- `-h, --host HOST`
+  已启动 Datalayers 的 HTTP host。
+- `-P, --port HTTP_PORT`
+  已启动 Datalayers 的 HTTP port。
+- `--dataset PATH`
+  keyed JSONL dataset 路径。默认指向仓库根目录下的稳定 dataset。
+- `--queries LIST`
+  逗号分隔 query 列表。
+- `--sink table|blackhole`
+  `table` 通过 sink table 的 `COUNT(*)` 判定完成；
+  `blackhole` 通过 Kafka consumer group lag 判定完成。
 - `--skip-build`
+  只在 `--datalayers-path` 模式下有效。跳过自动编译。
 - `--bench-root DIR`
+  本次 benchmark 的临时根目录。
 - `--no-cleanup`
-
-说明：
-
-- `--datalayers-path ABS_PATH`
-  - 必填
-  - 指向本地 Datalayers 仓库的绝对路径
-  - 脚本会优先复用 `<ABS_PATH>/target/reldev/datalayers` 和 `<ABS_PATH>/target/reldev/dlsql`
-  - 如果二进制不存在，且没有传 `--skip-build`，脚本会在该仓库下执行 `cargo build --profile reldev --bin datalayers --bin dlsql`
-- `--sink`
-  - `table`: 写 Datalayers table，通过 `COUNT(*)` 判定完成
-  - `blackhole`: 写 Datalayers blackhole sink，通过 Kafka consumer group lag 判定完成
-- `--skip-build`
-  - 跳过 `reldev` 编译，复用已有二进制
-- `--bench-root DIR`
-  - 指定本次 benchmark 的临时根目录
-- `--no-cleanup`
-  - 保留 Kafka 容器
-  - 保留 Datalayers 进程
-  - 保留 benchmark 创建的 database/source/sink/pipeline/table
+  只在 `--datalayers-path` 模式下有意义。保留 Kafka、临时启动的 Datalayers 进程以及 benchmark 创建的对象。
 
 ### `bench_risingwave.sh`
 
-支持：
+主要参数：
 
-- `--rows`
-- `--queries`
-- `--parallelism`
-- `--sink`
+- `--dataset PATH`
+  keyed JSONL dataset 路径。默认指向仓库根目录下的稳定 dataset。
+- `--queries LIST`
+  逗号分隔 query 列表。
+- `--parallelism N`
+  RisingWave `single_node` 的并行度。
+- `--sink table|blackhole`
+  `table` 创建 materialized view，并通过 `COUNT(*)` 判定完成。
+  `blackhole` 创建 blackhole sink，并通过 `rw_catalog.rw_kafka_job_lag` 判定完成。
 - `--bench-root DIR`
+  本次 benchmark 的临时根目录。
 - `--no-cleanup`
+  保留 Kafka、RisingWave 容器和 benchmark 创建的 source/MV/sink。
 - `--image IMAGE`
-
-说明：
-
-- `--parallelism`
-  - 控制 RisingWave `single_node` 并行度
-- `--sink`
-  - `table`: 创建 materialized view，通过 `COUNT(*)` 判定完成
-  - `blackhole`: 创建 blackhole sink，通过 `rw_catalog.rw_kafka_job_lag` 判定完成
-- `--bench-root DIR`
-  - 指定本次 benchmark 的临时根目录
-- `--no-cleanup`
-  - 保留 Kafka 容器
-  - 保留 RisingWave 容器和 network
-  - 保留 benchmark 创建的 source/materialized view/sink
-- `--image IMAGE`
-  - 覆盖默认镜像
-
-注意：
-
-- RisingWave 官方 benchmark 页面使用 `blackhole` 口径。
-- 当前本地环境更稳定的路径仍然是 `--sink table`，因为不同 RisingWave 版本对 `rw_catalog.rw_kafka_job_lag` 的可用性不完全一致。
-- 因此本地 `table` 结果不能直接和官方 `blackhole` 吞吐量绝对值或 query 间比值等同。
+  覆盖默认 RisingWave 镜像。
 
 ### `bench_flink.sh`
 
-支持：
+主要参数：
 
-- `--rows`
-- `--queries`
+- `--dataset PATH`
+  keyed JSONL dataset 路径。默认指向仓库根目录下的稳定 dataset。
+- `--queries LIST`
+  逗号分隔 query 列表。
 - `--bench-root DIR`
+  本次 benchmark 的临时根目录。
 - `--no-cleanup`
+  保留 Kafka 容器。
 
-说明：
+Flink runner 固定使用 blackhole sink。完成判定是 Kafka consumer group lag 到 0 后主动 cancel job。
 
-- Flink runner 固定使用官方 fixture。
-- Flink runner 固定使用 `blackhole` sink。
-- 完成判定通过 Kafka consumer group lag 到 0 后主动 cancel Flink job。
+## 指标口径
+
+三个 runner 都会统计这些核心指标：
+
+- `input_rows`
+  dataset 中的总输入行数。
+- `expected_rows`
+  同一份 bid 输入在该 query 语义下的理论输出行数。
+- `inserted_rows`
+  只出现在 Datalayers 和 RisingWave 的结果里。
+  对 `table` 模式，表示实际观察到的 sink/table 行数。
+  对 blackhole 场景，runner 仍然会保留这个字段，但值等于 `expected_rows`。
+- `replay_sec`
+  从创建 source/query 并开始 replay，到完成判定满足为止的耗时。
+- `throughput_rps`
+  `input_rows / replay_sec`。
+- `avg_cpu_percent`
+  replay 窗口内的平均 CPU。
+- `avg_mem_gib`
+  replay 窗口内的平均 RSS，单位 GiB。
+- `kafka_preload_sec`
+  本轮 query 输入 preload 到 Kafka 的耗时，不计入 `throughput_rps` 分母。
+
+Flink 的结果没有 `inserted_rows`，因为当前完成判定是 source 消费完所有输入后主动 cancel job，结果里保留的是 `expected_rows` 和 `state`。
+
+dataset stats 里的这些字段是提前从 dataset 扫描得到的：
+
+- `total_rows`
+- `q2_expected_rows`
+- `q14_expected_rows`
+- `q21_expected_rows`
 
 ## 结果文件
 
 每次 benchmark 的输出都会写到一个临时根目录。
 
-Datalayers:
+Datalayers：
 
 - `<bench_root>/datalayers/report.md`
 - `<bench_root>/datalayers/report.json`
 - `<bench_root>/datalayers/<query>_samples.csv`
 
-RisingWave:
+RisingWave：
 
 - `<bench_root>/risingwave/report.md`
 - `<bench_root>/risingwave/report.json`
 - `<bench_root>/risingwave/<query>_samples.csv`
 
-Flink:
+Flink：
 
 - `<bench_root>/flink/report.md`
 - `<bench_root>/flink/report.json`
 - `<bench_root>/flink/<query>_samples.csv`
 
-## 对象命名
+三个 `report.json` 现在都使用同一组顶层字段：
 
-Datalayers:
-
-- database: `nexmark_q21`
-- source: `q21_src`
-- pipeline: `q21_pipeline`
-- table sink: `q21_sink`
-- blackhole sink: `q21_bh`
-
-RisingWave:
-
-- source: `q21_src_<timestamp>`
-- materialized view: `q21_mv`
-- blackhole sink: `q21_bh`
-
-Flink:
-
-- source table: `q21_src`
-- sink table: `q21_sink`
-- statement set / insert job: `q21`
-
-## 保留现场后如何观察
-
-如果传了 `--no-cleanup`，benchmark 结束后仍然可以继续查看对象和数据。
-
-### Datalayers
-
-```bash
-bash ./bench_datalayers.sh --datalayers-path /home/nsc/datalayers --sink table --no-cleanup
-```
-
-查看 database：
-
-```bash
-./target/reldev/dlsql -h 127.0.0.1 -P <PORT> -u admin -p public -e "SHOW DATABASES"
-```
-
-查看 pipeline：
-
-```bash
-./target/reldev/dlsql -h 127.0.0.1 -P <PORT> -u admin -p public -d nexmark_q21 -e "SHOW PIPELINES"
-```
-
-查看 source：
-
-```bash
-./target/reldev/dlsql -h 127.0.0.1 -P <PORT> -u admin -p public -d nexmark_q21 -e "SHOW SOURCES"
-```
-
-查看 sink table 行数：
-
-```bash
-./target/reldev/dlsql -h 127.0.0.1 -P <PORT> -u admin -p public -d nexmark_q21 -e "SELECT COUNT(*) AS c FROM q21_sink"
-```
-
-如果是 `--sink blackhole`，可以查看 Kafka consumer group：
-
-```bash
-docker exec <KAFKA_CONTAINER> kafka-consumer-groups --bootstrap-server 127.0.0.1:9092 --describe --group <GROUP_ID>
-```
-
-### RisingWave
-
-```bash
-bash ./bench_risingwave.sh --parallelism 1 --sink table --no-cleanup
-```
-
-查看 source：
-
-```bash
-psql -h 127.0.0.1 -p <PORT> -U root -d dev -c "SELECT id, name FROM rw_catalog.rw_sources ORDER BY id"
-```
-
-查看 materialized view：
-
-```bash
-psql -h 127.0.0.1 -p <PORT> -U root -d dev -c "SELECT id, name FROM rw_catalog.rw_materialized_views ORDER BY id"
-```
-
-查看 sink：
-
-```bash
-psql -h 127.0.0.1 -p <PORT> -U root -d dev -c "SELECT id, name, connector, sink_type FROM rw_catalog.rw_sinks ORDER BY id"
-```
-
-查看 MV 行数：
-
-```bash
-psql -h 127.0.0.1 -p <PORT> -U root -d dev -c "SELECT COUNT(*) FROM q21_mv"
-```
-
-### Flink
-
-```bash
-bash ./bench_flink.sh --no-cleanup
-```
-
-查看 job：
-
-```bash
-curl -s http://127.0.0.1:<FLINK_REST_PORT>/jobs | jq
-```
-
-查看 Kafka consumer group：
-
-```bash
-docker exec <KAFKA_CONTAINER> kafka-consumer-groups --bootstrap-server 127.0.0.1:9092 --describe --group <GROUP_ID>
-```
-
-## 其他说明
-
-- 三个入口脚本都会为本轮 benchmark 生成唯一的临时目录、容器名和端口。
-- Datalayers 使用 host 可达的 Kafka broker。
-- RisingWave 使用容器网络内可达的 Kafka broker。
-- Flink 同时使用 host 侧和容器网络内 broker 地址。
-- dataset stats 里的 `q2_expected_rows`、`q14_expected_rows`、`q21_expected_rows` 表示同一批官方 bid 输入在对应 query 下的理论输出行数。
+- `generated_at`
+- `engine`
+- `mode`
+- `fixture`
+- `fixture_metadata`
+- `dataset_stats`
+- `sink_mode`
+- `results`

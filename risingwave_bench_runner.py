@@ -2,16 +2,16 @@
 """
 这个 bench runner 用来在本地 standalone RisingWave 上运行一组固定的 Nexmark 风格查询。
 
-它复用 `nexmark_fixture.py` 生成的官方 bid fixture：先从官方 Nexmark combined events
-中抽取 `Bid`，再把这些数据 preload 到 Kafka topic，随后让 RisingWave source 以
-`earliest` 方式回放。
+它消费的是一个已经预先准备好的 keyed bid JSONL dataset。这个 dataset 通常由
+`datagen.sh` 调用 `nexmark_fixture.py` 生成，并稳定保存在 `nexmark-bench` 目录下。
 
 执行方式：
 
 1. `bench_risingwave.sh` 负责启动 Kafka、RisingWave standalone 容器，并把连接参数传入本文件。
-2. 本文件准备官方 bid fixture，并为 Kafka 生成按 partition 打 key 的 preload 文件。
+2. 本文件扫描现有 dataset，计算输入行数和几个 query 的理论输出行数。
 3. 对每个 query：
    - 重建独立的 Kafka topic
+   - 把 keyed dataset preload 到 topic
    - 在 RisingWave 中创建 source
    - 按 sink 模式创建 materialized view 或 blackhole sink
    - 在 replay 窗口内采样 RisingWave 容器主进程的 CPU 和 RSS
@@ -34,7 +34,7 @@
 - `avg_mem_gib`
   replay 窗口内，对 RisingWave 容器主进程 RSS 做周期性 `ps` 采样后取平均值，并换算为 GiB。
 - `kafka_preload_sec`
-  把本轮 query 输入写入 Kafka topic 的耗时，单独记录，不计入 throughput 分母。
+  把本轮 query 输入数据写入 Kafka topic 的耗时，单独记录，不计入 throughput 分母。
 
 注意：
 
@@ -59,7 +59,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-from nexmark_fixture import prepare_official_bid_fixture
+from nexmark_fixture import scan_bid_dataset
 
 
 RESET = "\033[0m"
@@ -298,32 +298,6 @@ def summarize_samples(path: Path) -> tuple[float, float]:
     return avg_cpu, avg_mem_gib
 
 
-def prepare_fixture(
-    *,
-    workdir: Path,
-    dataset_name: str,
-    rows: int,
-    kafka_container: str,
-    kafka_brokers: str,
-    partitions: int,
-) -> tuple[Path, Path, dict[str, int], dict[str, object]]:
-    # Reuse the same official bid fixture as the Datalayers/Flink runners so cross-engine
-    # comparisons are based on identical input rows.
-    dataset_path = workdir / dataset_name
-    keyed_path = workdir / f"{dataset_path.stem}.keyed{dataset_path.suffix}"
-    result = prepare_official_bid_fixture(
-        workdir=workdir,
-        kafka_container=kafka_container,
-        kafka_brokers=kafka_brokers,
-        rows=rows,
-        partitions=partitions,
-        log=log,
-    )
-    shutil.copy2(result.dataset_path, dataset_path)
-    rewrite_dataset_with_keys(dataset_path, keyed_path, partitions)
-    return dataset_path, keyed_path, result.stats, result.metadata
-
-
 def run_cmd(cmd: list[str], input_path: Path | None = None, timeout: int = 300) -> None:
     stdin = None
     try:
@@ -410,20 +384,6 @@ def load_topic(container: str, topic: str, dataset_path: Path) -> float:
     elapsed = time.time() - start
     log(f"Finished Kafka preload for topic {topic} in {elapsed:.3f}s")
     return elapsed
-
-
-def rewrite_dataset_with_keys(
-    dataset_path: Path, keyed_path: Path, partitions: int
-) -> None:
-    # Deterministic keys keep partition assignment stable across repeated runs.
-    log(f"Rewriting dataset with Kafka keys into {keyed_path}")
-    with (
-        dataset_path.open("r", encoding="utf-8") as src,
-        keyed_path.open("w", encoding="utf-8") as dst,
-    ):
-        for index, line in enumerate(src):
-            dst.write(f"p{index % partitions}\t{line}")
-    log(f"Finished keyed dataset rewrite for {partitions} partitions")
 
 
 def wait_for_count(
@@ -564,20 +524,20 @@ def markdown_report(
         f"- RisingWave container: `{args.rw_container}`",
         f"- Kafka brokers in RisingWave: `{args.rw_kafka_brokers}`",
         f"- Topic partitions: `{args.partitions}`",
-        f"- Fixture: `official`",
+        f"- Fixture: `official keyed bid dataset`",
         f"- Sink mode: `{args.sink}`",
         f"- Input rows: `{dataset_stats['total_rows']}`",
-        f"- Dataset: bid events extracted from official Nexmark combined events",
+        f"- Dataset path: `{Path(args.dataset).resolve()}`",
         f"- Measurement mode: preload Kafka then replay from `earliest`",
         "",
         "## Results",
         "",
-        "| Query | Input Rows | Expected Rows | Actual Rows | Replay Seconds | Throughput (input records/s) | Avg CPU (%) | Avg Mem (GiB) | Kafka Preload Seconds |",
+        "| Query | Input Rows | Expected Rows | Inserted Rows | Replay Seconds | Throughput (input records/s) | Avg CPU (%) | Avg Mem (GiB) | Kafka Preload Seconds |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for item in results:
         lines.append(
-            "| {query} | {input_rows} | {expected_rows} | {actual_rows} | {replay_sec:.3f} | {throughput_rps:.1f} | {avg_cpu_percent:.2f} | {avg_mem_gib:.3f} | {kafka_preload_sec:.3f} |".format(
+            "| {query} | {input_rows} | {expected_rows} | {inserted_rows} | {replay_sec:.3f} | {throughput_rps:.1f} | {avg_cpu_percent:.2f} | {avg_mem_gib:.3f} | {kafka_preload_sec:.3f} |".format(
                 **item
             )
         )
@@ -596,35 +556,79 @@ def markdown_report(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run RisingWave Nexmark benchmarks")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=4566)
-    parser.add_argument("--user", default="root")
-    parser.add_argument("--database", default="dev")
-    parser.add_argument("--rw-container", default="risingwave-standalone")
-    parser.add_argument("--rw-kafka-brokers", default="kafka:9092")
-    parser.add_argument("--fixture-kafka-brokers", default="127.0.0.1:9092")
-    parser.add_argument("--kafka-container", default="risingwave-nexmark-kafka")
-    parser.add_argument("--workdir", default=".risingwave-nexmark")
-    parser.add_argument("--dataset-name", default="nexmark_bid.jsonl")
-    parser.add_argument("--rows", type=int, default=1_000_000)
-    parser.add_argument("--partitions", type=int, default=4)
-    parser.add_argument("--queries", default="q0,q1,q2,q14,q21,q22")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run RisingWave Nexmark benchmarks against a pre-generated keyed bid JSONL dataset."
+        )
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="RisingWave SQL host.")
+    parser.add_argument("--port", type=int, default=4566, help="RisingWave SQL port.")
+    parser.add_argument("--user", default="root", help="RisingWave SQL user.")
+    parser.add_argument("--database", default="dev", help="RisingWave database name.")
+    parser.add_argument(
+        "--rw-container",
+        default="risingwave-standalone",
+        help="Container name used for CPU and memory sampling.",
+    )
+    parser.add_argument(
+        "--rw-kafka-brokers",
+        default="kafka:9092",
+        help="Kafka bootstrap servers reachable from the RisingWave container.",
+    )
+    parser.add_argument(
+        "--kafka-container",
+        default="risingwave-nexmark-kafka",
+        help="Kafka container name used for topic management and preload.",
+    )
+    parser.add_argument(
+        "--workdir",
+        default=".risingwave-nexmark",
+        help="Working directory for reports and per-query sample CSV files.",
+    )
+    parser.add_argument(
+        "--dataset",
+        required=True,
+        help="Path to the keyed JSONL dataset used for Kafka preload.",
+    )
+    parser.add_argument(
+        "--partitions", type=int, default=4, help="Kafka topic partition count."
+    )
+    parser.add_argument(
+        "--queries",
+        default="q0,q1,q2,q14,q21,q22",
+        help="Comma-separated query list.",
+    )
     parser.add_argument(
         "--sink",
         choices=[mode.value for mode in SinkMode],
         default=SinkMode.TABLE.value,
     )
-    parser.add_argument("--no-cleanup", type=int, choices=[0, 1], default=0)
-    parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--sample-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--no-cleanup",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Set to 1 to keep Kafka topics and RisingWave objects after the run.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        help="Per-query completion timeout in seconds.",
+    )
+    parser.add_argument(
+        "--sample-interval",
+        type=float,
+        default=1.0,
+        help="CPU and RSS sampling interval in seconds.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     log(
-        f"Starting RisingWave Nexmark benchmark: rows={args.rows} queries={args.queries} "
+        f"Starting RisingWave Nexmark benchmark: dataset={args.dataset} queries={args.queries} "
         f"sink={args.sink} workdir={args.workdir}"
     )
     workdir = Path(args.workdir).resolve()
@@ -649,14 +653,9 @@ def main() -> int:
 
     sql = RisingWaveSql(args.host, args.port, args.user, args.database)
     workdir.mkdir(parents=True, exist_ok=True)
-    _dataset_path, keyed_path, dataset_stats, fixture_metadata = prepare_fixture(
-        workdir=workdir,
-        dataset_name=args.dataset_name,
-        rows=args.rows,
-        kafka_container=args.kafka_container,
-        kafka_brokers=args.fixture_kafka_brokers,
-        partitions=args.partitions,
-    )
+    dataset_path = Path(args.dataset).resolve()
+    dataset_stats = scan_bid_dataset(dataset_path)
+    fixture_metadata = {"dataset_path": str(dataset_path)}
 
     results: list[dict[str, object]] = []
     for query in queries:
@@ -671,7 +670,7 @@ def main() -> int:
         if not args.no_cleanup:
             cleanup_objects(sql, target, source, sink_mode)
         try:
-            kafka_preload_sec = load_topic(args.kafka_container, topic, keyed_path)
+            kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
             expected_rows = query.expected_rows(dataset_stats)
             sample_csv = workdir / f"{query.name}_samples.csv"
             monitor = ContainerMonitor(
@@ -685,20 +684,20 @@ def main() -> int:
                 create_source(sql, source, topic, args.rw_kafka_brokers)
                 if sink_mode == SinkMode.TABLE:
                     create_mv(sql, target, source, query)
-                    actual_rows = wait_for_count(
+                    inserted_rows = wait_for_count(
                         sql, target, expected_rows, args.timeout
                     )
                 else:
                     create_blackhole_sink(sql, target, source, query)
                     wait_for_lag_zero(sql, target, "sink", args.timeout)
-                    actual_rows = expected_rows
+                    inserted_rows = expected_rows
             finally:
                 monitor.stop()
             replay_t1 = time.time()
             replay_sec = replay_t1 - replay_t0
             avg_cpu_percent, avg_mem_gib = summarize_samples(sample_csv)
             log(
-                f"Finished benchmark for query {query.name}: actual_rows={actual_rows} "
+                f"Finished benchmark for query {query.name}: inserted_rows={inserted_rows} "
                 f"replay_sec={replay_sec:.3f} throughput={dataset_stats['total_rows'] / replay_sec if replay_sec > 0 else 0.0:.1f}",
                 color=GREEN,
             )
@@ -707,7 +706,7 @@ def main() -> int:
                     "query": query.name,
                     "input_rows": dataset_stats["total_rows"],
                     "expected_rows": expected_rows,
-                    "actual_rows": actual_rows,
+                    "inserted_rows": inserted_rows,
                     "replay_sec": round(replay_sec, 3),
                     "throughput_rps": round(dataset_stats["total_rows"] / replay_sec, 1)
                     if replay_sec > 0
@@ -732,7 +731,7 @@ def main() -> int:
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "engine": "risingwave",
                 "mode": "preload_then_earliest_replay",
-                "fixture": "official",
+                "fixture": "official keyed bid dataset",
                 "fixture_metadata": fixture_metadata,
                 "dataset_stats": dataset_stats,
                 "sink_mode": sink_mode.value,

@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 
-# 这个脚本是 Flink Nexmark benchmark 的本地入口。
-# 它负责准备临时目录、启动 Kafka，并把 Kafka 地址、dataset 和工作目录参数传给
-# `flink_bench_runner.py`。Flink toolchain 准备、query 执行、指标统计和 report
-# 生成都在 Python runner 里完成。
+# 这个脚本负责一次性生成可复用的 Nexmark keyed bid dataset。
+# 它会启动临时 Kafka，调用 `nexmark_fixture.py prepare` 使用 nexmark-flink 生成官方
+# combined events，再抽取 bid 事件并写成稳定命名的 keyed JSONL 文件。
 
 set -euo pipefail
 
 usage() {
 	cat <<'EOF'
-运行本地 Flink Nexmark benchmark。
+生成可复用的 Nexmark keyed bid dataset。
 
 Usage:
-  bench_flink.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22] [--bench-root DIR] [--no-cleanup]
+  datagen.sh [--dataset PATH] [--stats-output PATH] [--rows N] [--partitions N]
+             [--bench-root DIR] [--no-cleanup]
+
+Options:
+  --dataset PATH       Output keyed JSONL dataset path. Default: ./nexmark_bid.keyed.jsonl
+  --stats-output PATH  Output dataset stats JSON path. Default: ./nexmark_bid.stats.json
+  --rows N             Target number of bid rows kept in the generated dataset.
+  --partitions N       Number of logical keys used when writing the keyed dataset.
+  --bench-root DIR     Temporary work root used while generating the dataset.
+  --no-cleanup         Keep the temporary Kafka container and work directory.
+  --help               Show this message.
 EOF
 }
 
@@ -23,19 +32,29 @@ log() {
 	printf '[%s UTC] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$1"
 }
 
-queries="q0,q1,q2,q14,q21,q22"
+rows="1000000"
+partitions="4"
+dataset_path="$project_root/nexmark_bid.keyed.jsonl"
+stats_output="$project_root/nexmark_bid.stats.json"
 no_cleanup="0"
 bench_root=""
-dataset="$project_root/nexmark_bid.keyed.jsonl"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-	--queries)
-		queries="$2"
+	--dataset)
+		dataset_path="$2"
 		shift 2
 		;;
-	--dataset)
-		dataset="$2"
+	--stats-output)
+		stats_output="$2"
+		shift 2
+		;;
+	--rows)
+		rows="$2"
+		shift 2
+		;;
+	--partitions)
+		partitions="$2"
 		shift 2
 		;;
 	--bench-root)
@@ -46,7 +65,7 @@ while [[ $# -gt 0 ]]; do
 		no_cleanup="1"
 		shift
 		;;
-	-h | --help)
+	--help)
 		usage
 		exit 0
 		;;
@@ -58,20 +77,14 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-dataset="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$dataset")"
-if [[ ! -f "$dataset" ]]; then
-	echo "dataset does not exist: $dataset" >&2
-	exit 1
-fi
-
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
 if [[ -z "$bench_root" ]]; then
-	bench_root="$(mktemp -d "${TMPDIR:-/tmp}/nexmark-bench.XXXXXX")"
+	bench_root="$(mktemp -d "${TMPDIR:-/tmp}/nexmark-datagen.XXXXXX")"
 fi
-work_dir="$bench_root/flink"
+work_dir="$bench_root/datagen"
 run_id="$(basename "$bench_root" | tr -c '[:alnum:]' '-')"
-kafka_container="flink-nexmark-kafka-${run_id}"
+kafka_container="nexmark-datagen-kafka-${run_id}"
 kafka_host_port=""
 
 cleanup_services() {
@@ -79,6 +92,7 @@ cleanup_services() {
 		return
 	fi
 	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+	rm -rf "$work_dir"
 }
 
 trap cleanup_services EXIT
@@ -110,20 +124,16 @@ find_free_port() {
 }
 
 prepare_workspace() {
-	# Keep per-run outputs isolated because Flink leaves logs and local state in the workdir.
-	log "Preparing Flink benchmark workspace at $work_dir"
-	cleanup_services
+	log "Preparing datagen workspace at $work_dir"
 	rm -rf "$work_dir"
 	mkdir -p "$work_dir"
 }
 
 start_kafka() {
-	# Kafka is recreated per run so the replay harness starts from a clean topic set.
 	log "Starting Kafka container $kafka_container on host port $kafka_host_port"
 	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
 	docker run -d --name "$kafka_container" \
-		--label datalayers.nexmark.bench=1 \
-		--label datalayers.nexmark.run_id="$run_id" \
+		--label nexmark.bench.datagen=1 \
 		-p "${kafka_host_port}:9092" \
 		-e KAFKA_NODE_ID=1 \
 		-e KAFKA_PROCESS_ROLES=broker,controller \
@@ -152,23 +162,27 @@ start_kafka() {
 	log "Kafka container $kafka_container is ready"
 }
 
-run_bench() {
-	# The Python runner starts Flink, submits jobs and aggregates metrics.
-	log "Running Flink Nexmark benchmark: dataset=$dataset queries=$queries"
-	python3 ./flink_bench_runner.py \
-		--kafka-container "$kafka_container" \
-		--kafka-port "$kafka_host_port" \
+run_datagen() {
+	local dataset_abs stats_abs
+	dataset_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$dataset_path")"
+	stats_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$stats_output")"
+	log "Generating keyed dataset into $dataset_abs"
+	python3 ./nexmark_fixture.py prepare \
 		--workdir "$work_dir" \
-		--dataset "$dataset" \
-		--queries "$queries"
-	log "Flink Nexmark benchmark finished"
+		--output "$dataset_abs" \
+		--stats-output "$stats_abs" \
+		--kafka-container "$kafka_container" \
+		--kafka-brokers "127.0.0.1:${kafka_host_port}" \
+		--rows "$rows" \
+		--partitions "$partitions"
+	log "Datagen finished"
 }
 
 prepare_workspace
 kafka_host_port="$(find_free_port 9092 9192)"
 start_kafka
-run_bench
+run_datagen
 
-echo "report: $work_dir/report.md"
-echo "json:   $work_dir/report.json"
-echo "root:   $bench_root"
+echo "dataset: $dataset_path"
+echo "stats:   $stats_output"
+echo "root:    $bench_root"

@@ -44,6 +44,7 @@ import subprocess
 import tarfile
 import time
 import urllib.request
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -64,9 +65,9 @@ NEXMARK_FLINK_URL = (
     "https://github.com/nexmark/nexmark/releases/download/v0.2.0/nexmark-flink.tgz"
 )
 OFFICIAL_EVENT_TOPIC = "nexmark"
-OFFICIAL_BID_TOPIC = "nexmark-bid"
 OFFICIAL_EVENT_RATIOS = (1, 3, 46)
 OFFICIAL_BID_FRACTION = OFFICIAL_EVENT_RATIOS[2] / sum(OFFICIAL_EVENT_RATIOS)
+DEFAULT_TARGET_BID_ROWS = 1_000_000
 FLINK_JAVA_MODULE_OPTS = (
     "--add-exports=java.base/sun.net.util=ALL-UNNAMED "
     "--add-exports=java.rmi/sun.rmi.registry=ALL-UNNAMED "
@@ -492,7 +493,6 @@ def prepare_official_bid_fixture(
         f"(events={generated_events}, target_bid_rows={rows})"
     )
     _ensure_topic(_run_cmd, kafka_container, OFFICIAL_EVENT_TOPIC, partitions)
-    _ensure_topic(_run_cmd, kafka_container, OFFICIAL_BID_TOPIC, partitions)
 
     env = dict(
         os.environ,
@@ -576,7 +576,6 @@ def prepare_official_bid_fixture(
             "official Nexmark generator did not yield enough bid rows after retries; "
             f"last batch size={len(last_consumer_output.splitlines())}"
         )
-    _produce_file_to_topic(_run_cmd, kafka_container, OFFICIAL_BID_TOPIC, dataset_path)
     log(
         "Prepared official Nexmark bid fixture: "
         f"rows={stats['total_rows']} q2={stats['q2_expected_rows']} "
@@ -588,8 +587,141 @@ def prepare_official_bid_fixture(
         metadata={
             "fixture": "official",
             "combined_topic": OFFICIAL_EVENT_TOPIC,
-            "bid_topic": OFFICIAL_BID_TOPIC,
             "generated_events": generated_events,
             "flink_version": FLINK_VERSION,
         },
     )
+
+
+def write_keyed_bid_dataset(
+    dataset_path: Path, output_path: Path, partitions: int
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        dataset_path.open("r", encoding="utf-8") as src,
+        output_path.open("w", encoding="utf-8") as dst,
+    ):
+        for index, line in enumerate(src):
+            dst.write(f"p{index % partitions}\t{line}")
+
+
+def scan_bid_dataset(dataset_path: Path) -> dict[str, int]:
+    stats = {
+        "total_rows": 0,
+        "q2_expected_rows": 0,
+        "q14_expected_rows": 0,
+        "q21_expected_rows": 0,
+    }
+    with dataset_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            payload = line.split("\t", 1)[1] if "\t" in line else line
+            record = json.loads(payload)
+            stats["total_rows"] += 1
+            if record["auction"] in {1007, 1020, 2001, 2019, 2087}:
+                stats["q2_expected_rows"] += 1
+            converted_price = float(record["price"]) * 0.908
+            if 1_000_000 < converted_price < 50_000_000:
+                stats["q14_expected_rows"] += 1
+            channel = str(record["channel"]).lower()
+            if channel in {
+                "apple",
+                "google",
+                "facebook",
+                "baidu",
+            } or "channel_id=" in str(record["url"]):
+                stats["q21_expected_rows"] += 1
+    return stats
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Prepare or inspect the shared Nexmark bid dataset"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    prepare = subparsers.add_parser(
+        "prepare",
+        help="Generate a stable keyed Nexmark bid dataset from the official nexmark-flink generator",
+    )
+    prepare.add_argument(
+        "--workdir",
+        default=".nexmark-datagen",
+        help="Temporary work directory used while running Flink datagen.",
+    )
+    prepare.add_argument(
+        "--output",
+        required=True,
+        help="Output path of the final keyed JSONL dataset.",
+    )
+    prepare.add_argument(
+        "--stats-output",
+        required=True,
+        help="Output path of the dataset stats JSON sidecar.",
+    )
+    prepare.add_argument(
+        "--kafka-container",
+        required=True,
+        help="Kafka container name used during official Nexmark event generation.",
+    )
+    prepare.add_argument(
+        "--kafka-brokers",
+        default="127.0.0.1:9092",
+        help="Kafka bootstrap servers visible to the local Flink datagen runtime.",
+    )
+    prepare.add_argument(
+        "--rows",
+        type=int,
+        default=DEFAULT_TARGET_BID_ROWS,
+        help="Target number of bid rows to keep in the generated dataset.",
+    )
+    prepare.add_argument(
+        "--partitions",
+        type=int,
+        default=4,
+        help="Number of logical keys used when writing the keyed JSONL output.",
+    )
+
+    scan = subparsers.add_parser(
+        "scan",
+        help="Scan an existing keyed or plain bid dataset and print dataset stats as JSON",
+    )
+    scan.add_argument("dataset", help="Path to the keyed or plain bid dataset.")
+    return parser.parse_args()
+
+
+def _cli_log(message: str) -> None:
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    print(f"[{now} UTC] {message}", flush=True)
+
+
+def main() -> int:
+    args = _parse_args()
+    if args.command == "scan":
+        stats = scan_bid_dataset(Path(args.dataset).resolve())
+        print(json.dumps(stats, indent=2))
+        return 0
+
+    workdir = Path(args.workdir).resolve()
+    output_path = Path(args.output).resolve()
+    stats_output = Path(args.stats_output).resolve()
+    result = prepare_official_bid_fixture(
+        workdir=workdir,
+        kafka_container=args.kafka_container,
+        kafka_brokers=args.kafka_brokers,
+        rows=args.rows,
+        partitions=args.partitions,
+        log=_cli_log,
+    )
+    write_keyed_bid_dataset(result.dataset_path, output_path, args.partitions)
+    stats_output.parent.mkdir(parents=True, exist_ok=True)
+    stats_output.write_text(json.dumps(result.stats, indent=2) + "\n", encoding="utf-8")
+    _cli_log(f"Wrote keyed dataset to {output_path}")
+    _cli_log(f"Wrote dataset stats to {stats_output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

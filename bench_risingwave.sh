@@ -2,7 +2,7 @@
 
 # 这个脚本是 RisingWave Nexmark benchmark 的本地入口。
 # 它负责准备临时目录、启动 Kafka 和 RisingWave standalone 容器，然后把网络、
-# 端口、镜像和工作目录参数传给 `risingwave_bench_runner.py`。真正的 fixture 准备、
+# 端口、镜像、dataset 和工作目录参数传给 `risingwave_bench_runner.py`。真正的
 # query 执行、指标统计和 report 生成都在 Python runner 里完成。
 
 set -euo pipefail
@@ -12,34 +12,34 @@ usage() {
 运行本地 RisingWave Nexmark benchmark。
 
 Usage:
-  bench_risingwave.sh [--rows N] [--queries q0,q1,q2,q14,q21,q22] [--parallelism N] [--sink table|blackhole]
+  bench_risingwave.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22] [--parallelism N] [--sink table|blackhole]
                       [--bench-root DIR] [--no-cleanup] [--image IMAGE]
 EOF
 }
 
-repo_root="$(git rev-parse --show-toplevel)"
-cd "$repo_root"
+project_root="$(cd "$(dirname "$0")" && pwd)"
+cd "$project_root"
 
 log() {
 	printf '[%s UTC] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$1"
 }
 
-rows="1000000"
 queries="q0,q1,q2,q14,q21,q22"
 parallelism="1"
 sink="table"
 no_cleanup="0"
 bench_root=""
 rw_image="${RISINGWAVE_IMAGE:-risingwavelabs/risingwave:v2.8.3}"
+dataset="$project_root/nexmark_bid.keyed.jsonl"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-	--rows)
-		rows="$2"
-		shift 2
-		;;
 	--queries)
 		queries="$2"
+		shift 2
+		;;
+	--dataset)
+		dataset="$2"
 		shift 2
 		;;
 	--parallelism)
@@ -73,6 +73,12 @@ while [[ $# -gt 0 ]]; do
 		;;
 	esac
 done
+
+dataset="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$dataset")"
+if [[ ! -f "$dataset" ]]; then
+	echo "dataset does not exist: $dataset" >&2
+	exit 1
+fi
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
@@ -208,7 +214,7 @@ wait_for_risingwave_kafka_connectivity() {
 
 run_bench() {
 	# The Python runner performs the actual per-query replay and metric collection.
-	log "Running RisingWave Nexmark benchmark: rows=$rows queries=$queries sink=$sink parallelism=$parallelism"
+	log "Running RisingWave Nexmark benchmark: dataset=$dataset queries=$queries sink=$sink parallelism=$parallelism"
 	python3 ./risingwave_bench_runner.py \
 		--host 127.0.0.1 \
 		--port "$rw_host_port" \
@@ -216,10 +222,9 @@ run_bench() {
 		--database dev \
 		--rw-container "$rw_container" \
 		--rw-kafka-brokers kafka:9092 \
-		--fixture-kafka-brokers "127.0.0.1:${kafka_host_port}" \
 		--kafka-container "$kafka_container" \
 		--workdir "$work_dir" \
-		--rows "$rows" \
+		--dataset "$dataset" \
 		--queries "$queries" \
 		--sink "$sink" \
 		--no-cleanup "$no_cleanup"
