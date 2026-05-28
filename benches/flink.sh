@@ -12,7 +12,7 @@ usage() {
 运行本地 Flink Nexmark benchmark。
 
 Usage:
-  flink.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22] [--bench-root DIR] [--no-cleanup]
+  flink.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22] [--bench-root DIR] [--parallelism N] [--no-cleanup]
 
 参数:
   --dataset PATH
@@ -26,6 +26,10 @@ Usage:
 
   --bench-root DIR
       benchmark 临时根目录。
+
+  --parallelism N
+      Flink 任务并行度。
+      默认: 1
 
   --no-cleanup
       保留 Kafka 容器。
@@ -44,6 +48,7 @@ log() {
 }
 
 queries="q0,q1,q2,q14,q21,q22"
+parallelism="1"
 no_cleanup="0"
 bench_root=""
 dataset="$project_root/nexmark_bid.keyed.jsonl"
@@ -60,6 +65,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--bench-root)
 		bench_root="$2"
+		shift 2
+		;;
+	--parallelism)
+		parallelism="$2"
 		shift 2
 		;;
 	--no-cleanup)
@@ -101,6 +110,10 @@ cleanup_services() {
 	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
 }
 
+pre_cleanup() {
+	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+}
+
 trap cleanup_services EXIT
 
 wait_for_port() {
@@ -132,7 +145,7 @@ find_free_port() {
 prepare_workspace() {
 	# Keep per-run outputs isolated because Flink leaves logs and local state in the workdir.
 	log "Preparing Flink benchmark workspace at $work_dir"
-	cleanup_services
+	pre_cleanup
 	rm -rf "$work_dir"
 	mkdir -p "$work_dir"
 }
@@ -142,14 +155,14 @@ start_kafka() {
 	log "Starting Kafka container $kafka_container on host port $kafka_host_port"
 	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
 	docker run -d --name "$kafka_container" \
-		--label datalayers.nexmark.bench=1 \
-		--label datalayers.nexmark.run_id="$run_id" \
-		-p "${kafka_host_port}:9092" \
+		--label flink.nexmark.bench=1 \
+		--label flink.nexmark.run_id="$run_id" \
+		-p "${kafka_host_port}:29092" \
 		-e KAFKA_NODE_ID=1 \
 		-e KAFKA_PROCESS_ROLES=broker,controller \
-		-e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
-		-e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:${kafka_host_port} \
-		-e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+		-e KAFKA_LISTENERS=PLAINTEXT://:9092,PLAINTEXT_HOST://:29092,CONTROLLER://:9093 \
+		-e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:9092,PLAINTEXT_HOST://127.0.0.1:${kafka_host_port} \
+		-e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT \
 		-e KAFKA_CONTROLLER_QUORUM_VOTERS=1@127.0.0.1:9093 \
 		-e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
 		-e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
@@ -161,7 +174,7 @@ start_kafka() {
 		confluentinc/cp-kafka:7.7.1 >/dev/null
 	wait_for_port 127.0.0.1 "$kafka_host_port" kafka
 	local deadline=$((SECONDS + 120))
-	until docker exec "$kafka_container" kafka-topics --bootstrap-server 127.0.0.1:9092 --list >/dev/null 2>&1; do
+	until docker logs "$kafka_container" 2>&1 | grep -q 'Kafka Server started'; do
 		if ((SECONDS >= deadline)); then
 			docker logs "$kafka_container" >&2 || true
 			echo "timeout waiting for kafka broker readiness" >&2
@@ -174,13 +187,15 @@ start_kafka() {
 
 run_bench() {
 	# The Python runner starts Flink, submits jobs and aggregates metrics.
-	log "Running Flink Nexmark benchmark: dataset=$dataset queries=$queries"
+	log "Running Flink Nexmark benchmark: dataset=$dataset queries=$queries parallelism=$parallelism"
 	python3 ./runners/flink.py \
 		--kafka-container "$kafka_container" \
 		--kafka-port "$kafka_host_port" \
 		--workdir "$work_dir" \
 		--dataset "$dataset" \
-		--queries "$queries"
+		--queries "$queries" \
+		--parallelism "$parallelism" \
+		--no-cleanup "$no_cleanup"
 	log "Flink Nexmark benchmark finished"
 }
 

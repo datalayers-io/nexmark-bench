@@ -135,6 +135,12 @@ cleanup_services() {
 	docker network rm "$kafka_network" >/dev/null 2>&1 || true
 }
 
+pre_cleanup() {
+	docker rm -f "$arroyo_container" >/dev/null 2>&1 || true
+	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+	docker network rm "$kafka_network" >/dev/null 2>&1 || true
+}
+
 trap cleanup_services EXIT
 
 wait_for_port() {
@@ -165,7 +171,7 @@ find_free_port() {
 
 prepare_workspace() {
 	log "Preparing Arroyo benchmark workspace at $work_dir"
-	cleanup_services
+	pre_cleanup
 	rm -rf "$work_dir"
 	mkdir -p "$work_dir"
 }
@@ -180,8 +186,8 @@ start_kafka() {
 	docker run -d --name "$kafka_container" \
 		--network "$kafka_network" \
 		--network-alias kafka \
-		--label datalayers.nexmark.bench=1 \
-		--label datalayers.nexmark.run_id="$run_id" \
+		--label arroyo.nexmark.bench=1 \
+		--label arroyo.nexmark.run_id="$run_id" \
 		-p "${kafka_host_port}:29092" \
 		-e KAFKA_NODE_ID=1 \
 		-e KAFKA_PROCESS_ROLES=broker,controller \
@@ -215,9 +221,10 @@ start_arroyo() {
 	docker rm -f "$arroyo_container" >/dev/null 2>&1 || true
 	docker run -d --name "$arroyo_container" \
 		--network "$kafka_network" \
-		--label datalayers.nexmark.bench=1 \
-		--label datalayers.nexmark.run_id="$run_id" \
+		--label arroyo.nexmark.bench=1 \
+		--label arroyo.nexmark.run_id="$run_id" \
 		-p "${arroyo_host_port}:5115" \
+		-e ARROYO__PROCESS_SCHEDULER__SLOTS_PER_PROCESS=1 \
 		"$arroyo_image" >/dev/null
 	wait_for_port 127.0.0.1 "$arroyo_host_port" arroyo
 	local deadline=$((SECONDS + 120))

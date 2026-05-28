@@ -133,6 +133,12 @@ cleanup_services() {
 	docker network rm "$kafka_network" >/dev/null 2>&1 || true
 }
 
+pre_cleanup() {
+	docker rm -f "$rw_container" >/dev/null 2>&1 || true
+	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+	docker network rm "$kafka_network" >/dev/null 2>&1 || true
+}
+
 trap cleanup_services EXIT
 
 wait_for_port() {
@@ -164,7 +170,7 @@ find_free_port() {
 prepare_workspace() {
 	# Keep every run isolated because RisingWave persists local state under the work directory.
 	log "Preparing RisingWave benchmark workspace at $work_dir"
-	cleanup_services
+	pre_cleanup
 	rm -rf "$work_dir"
 	mkdir -p "$work_dir" "$risingwave_store_dir"
 }
@@ -181,8 +187,8 @@ start_kafka() {
 	docker run -d --name "$kafka_container" \
 		--network "$kafka_network" \
 		--network-alias kafka \
-		--label datalayers.nexmark.bench=1 \
-		--label datalayers.nexmark.run_id="$run_id" \
+		--label risingwave.nexmark.bench=1 \
+		--label risingwave.nexmark.run_id="$run_id" \
 		-p "${kafka_host_port}:29092" \
 		-e KAFKA_NODE_ID=1 \
 		-e KAFKA_PROCESS_ROLES=broker,controller \
@@ -217,8 +223,8 @@ start_risingwave() {
 	docker rm -f "$rw_container" >/dev/null 2>&1 || true
 	docker run -d --name "$rw_container" \
 		--network "$kafka_network" \
-		--label datalayers.nexmark.bench=1 \
-		--label datalayers.nexmark.run_id="$run_id" \
+		--label risingwave.nexmark.bench=1 \
+		--label risingwave.nexmark.run_id="$run_id" \
 		-p "${rw_host_port}:4566" \
 		-v "$risingwave_store_dir:/risingwave/store" \
 		"$rw_image" \
@@ -256,6 +262,7 @@ run_bench() {
 		--workdir "$work_dir" \
 		--dataset "$dataset" \
 		--queries "$queries" \
+		--parallelism "$parallelism" \
 		--sink "$sink" \
 		--no-cleanup "$no_cleanup"
 	log "RisingWave Nexmark benchmark finished"

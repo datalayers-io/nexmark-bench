@@ -748,30 +748,30 @@ def main() -> int:
             monitor = ContainerMonitor(
                 args.arroyo_container, sample_csv, args.sample_interval
             )
+            pipeline = api.request(
+                "POST",
+                "/pipelines",
+                {
+                    "name": pipeline_name,
+                    "query": sql,
+                    "parallelism": args.parallelism,
+                    "checkpoint_interval_micros": 24 * 60 * 60 * 1_000_000,
+                },
+                timeout=120,
+            )
+            pipeline_id = str(pipeline["id"])
+            job = wait_for_job_state(
+                api, pipeline_id, terminal_only=False, timeout=args.timeout
+            )
+            state = str(job["state"])
+            if state == "Failed":
+                raise BenchError(
+                    f"arroyo job failed immediately for query {query.name}"
+                )
             replay_t0 = time.time()
             log(f"Starting replay window for query {query.name}")
             monitor.start()
             try:
-                pipeline = api.request(
-                    "POST",
-                    "/pipelines",
-                    {
-                        "name": pipeline_name,
-                        "query": sql,
-                        "parallelism": args.parallelism,
-                        "checkpoint_interval_micros": 24 * 60 * 60 * 1_000_000,
-                    },
-                    timeout=120,
-                )
-                pipeline_id = str(pipeline["id"])
-                job = wait_for_job_state(
-                    api, pipeline_id, terminal_only=False, timeout=args.timeout
-                )
-                state = str(job["state"])
-                if state == "Failed":
-                    raise BenchError(
-                        f"arroyo job failed immediately for query {query.name}"
-                    )
                 wait_for_group_lag_zero(
                     args.kafka_container, group, topic, args.timeout
                 )
@@ -815,7 +815,21 @@ def main() -> int:
                 except Exception:
                     pass
                 try:
-                    ensure_topic(args.kafka_container, topic, args.partitions)
+                    run_cmd(
+                        [
+                            "docker",
+                            "exec",
+                            args.kafka_container,
+                            "kafka-topics",
+                            "--bootstrap-server",
+                            "127.0.0.1:9092",
+                            "--delete",
+                            "--if-exists",
+                            "--topic",
+                            topic,
+                        ],
+                        timeout=30,
+                    )
                 except Exception:
                     pass
 

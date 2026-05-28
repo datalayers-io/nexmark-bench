@@ -754,6 +754,7 @@ def markdown_report(
         f"- RisingWave container: `{args.rw_container}`",
         f"- Kafka brokers in RisingWave: `{args.rw_kafka_brokers}`",
         f"- Topic partitions: `{args.partitions}`",
+        f"- Streaming parallelism: `{args.parallelism}`",
         f"- Fixture: `official keyed bid dataset`",
         f"- Sink mode: `{args.sink}`",
         f"- Input rows: `{dataset_stats['total_rows']}`",
@@ -831,6 +832,12 @@ def parse_args() -> argparse.Namespace:
         help="逗号分隔的 query 列表。",
     )
     parser.add_argument(
+        "--parallelism",
+        type=int,
+        default=1,
+        help="RisingWave streaming parallelism，创建 source/MV/sink 前通过 SET streaming_parallelism 生效。",
+    )
+    parser.add_argument(
         "--sink",
         choices=[mode.value for mode in SinkMode],
         default=SinkMode.TABLE.value,
@@ -885,6 +892,7 @@ def main() -> int:
     sink_mode = SinkMode(args.sink)
 
     sql = RisingWaveSql(args.host, args.port, args.user, args.database)
+    sql.run(f"SET streaming_parallelism = {args.parallelism}")
     workdir.mkdir(parents=True, exist_ok=True)
     dataset_path = Path(args.dataset).resolve()
     dataset_stats = load_bid_dataset_stats(dataset_path)
@@ -910,18 +918,18 @@ def main() -> int:
                 args.rw_container, sample_csv, args.sample_interval
             )
             group_id_prefix = f"{RW_GROUP_ID_PREFIX}-{source}"
+            create_source(sql, source, topic, args.rw_kafka_brokers, group_id_prefix)
+            fragment_id = source_fragment_id(sql, source)
+            group = f"{group_id_prefix}-{fragment_id}"
+            if sink_mode == SinkMode.TABLE:
+                create_mv(sql, target, source, query)
+            else:
+                create_blackhole_sink(sql, target, source, query)
             replay_t0 = time.time()
             log(f"Starting replay window for query {query.name}")
             monitor.start()
             try:
-                # The replay window intentionally includes source and sink/MV creation.
-                create_source(
-                    sql, source, topic, args.rw_kafka_brokers, group_id_prefix
-                )
-                fragment_id = source_fragment_id(sql, source)
-                group = f"{group_id_prefix}-{fragment_id}"
                 if sink_mode == SinkMode.TABLE:
-                    create_mv(sql, target, source, query)
                     inserted_rows = wait_for_count(
                         sql,
                         target,
@@ -932,7 +940,6 @@ def main() -> int:
                         args.timeout,
                     )
                 else:
-                    create_blackhole_sink(sql, target, source, query)
                     target_sink_id = sink_id(sql, target)
                     inserted_rows = wait_for_sink_input_rows(
                         args.rw_container,
@@ -984,6 +991,7 @@ def main() -> int:
                 "fixture": "official keyed bid dataset",
                 "fixture_metadata": fixture_metadata,
                 "dataset_stats": dataset_stats,
+                "parallelism": args.parallelism,
                 "sink_mode": sink_mode.value,
                 "results": results,
             },

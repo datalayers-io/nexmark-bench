@@ -457,6 +457,29 @@ def parse_job_id(output: str) -> str:
     return match.group(1)
 
 
+def read_job_id_from_proc(proc: subprocess.Popen[str], timeout: int) -> str:
+    deadline = time.time() + timeout
+    accumulated = ""
+    while time.time() < deadline:
+        line = proc.stdout.readline()
+        if line:
+            accumulated += line
+        match = re.search(r"Job ID:\s*([A-Za-z0-9]+)", accumulated)
+        if match:
+            return match.group(1)
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    if proc.poll() is not None:
+        stderr_text = proc.stderr.read() if proc.stderr else ""
+        raise BenchError(
+            f"sql-client exited early (rc={proc.returncode}):\n{accumulated}\n{stderr_text}"
+        )
+    raise BenchError(
+        f"timeout waiting for Flink job id from sql-client:\n{accumulated}"
+    )
+
+
 def kafka_group_lag(container: str, group: str, topic: str) -> int | None:
     result = subprocess.run(
         [
@@ -505,8 +528,10 @@ def wait_for_group_lag_zero(
     )
 
 
-def create_runtime(workdir: Path) -> tuple[Path, Path, int]:
-    cache_root = Path.home() / ".cache" / "datalayers-nexmark"
+def create_runtime(
+    workdir: Path, parallelism: int, rest_port: int
+) -> tuple[Path, Path]:
+    cache_root = Path.home() / ".cache" / "flink-nexmark"
     flink_home, nexmark_home = prepare_flink_toolchain(cache_root)
     runtime_root = workdir / "flink_runtime"
     if runtime_root.exists():
@@ -516,29 +541,28 @@ def create_runtime(workdir: Path) -> tuple[Path, Path, int]:
     runtime_nexmark = runtime_root / "nexmark-flink"
     shutil.copytree(flink_home, runtime_flink, symlinks=True)
     shutil.copytree(nexmark_home, runtime_nexmark, symlinks=True)
-    rest_port = 0
     conf = runtime_flink / "conf" / "flink-conf.yaml"
     lines = conf.read_text(encoding="utf-8").splitlines()
     new_lines: list[str] = []
+    found_rest = False
     for line in lines:
         if line.startswith("rest.port:"):
-            rest_port = 18081
+            found_rest = True
             new_lines.append(f"rest.port: {rest_port}")
         elif line.startswith("rest.address:"):
             new_lines.append("rest.address: localhost")
         elif line.startswith("jobmanager.rpc.address:"):
             new_lines.append("jobmanager.rpc.address: localhost")
         elif line.startswith("parallelism.default:"):
-            new_lines.append("parallelism.default: 1")
+            new_lines.append(f"parallelism.default: {parallelism}")
         elif line.startswith("taskmanager.numberOfTaskSlots:"):
-            new_lines.append("taskmanager.numberOfTaskSlots: 1")
+            new_lines.append(f"taskmanager.numberOfTaskSlots: {parallelism}")
         else:
             new_lines.append(line)
-    if rest_port == 0:
-        rest_port = 18081
+    if not found_rest:
         new_lines.append(f"rest.port: {rest_port}")
     conf.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-    return runtime_flink, runtime_nexmark, rest_port
+    return runtime_flink, runtime_nexmark
 
 
 def flink_pids(runtime_flink: Path) -> list[int]:
@@ -552,14 +576,14 @@ def flink_pids(runtime_flink: Path) -> list[int]:
     return pids
 
 
-def render_sql(topic: str, query: QuerySpec) -> str:
-    # Each query is rendered into a self-contained SQL script with one Kafka source table and one
-    # blackhole sink table.
-    source = "bid_src"
-    sink = "discard_sink"
+def render_sql(topic: str, query: QuerySpec, kafka_port: int) -> str:
+    source = f"bid_src_{query.name}"
+    sink = f"discard_sink_{query.name}"
     return (
         f"""
 SET 'execution.runtime-mode' = 'streaming';
+DROP TABLE IF EXISTS {source};
+DROP TABLE IF EXISTS {sink};
 CREATE TABLE {source} (
     auction BIGINT,
     bidder BIGINT,
@@ -571,7 +595,7 @@ CREATE TABLE {source} (
 ) WITH (
     'connector' = 'kafka',
     'topic' = '{topic}',
-    'properties.bootstrap.servers' = '127.0.0.1:9092',
+    'properties.bootstrap.servers' = '127.0.0.1:{kafka_port}',
     'properties.group.id' = 'flink-{query.name}',
     'scan.startup.mode' = 'earliest-offset',
     'format' = 'json'
@@ -599,6 +623,7 @@ def markdown_report(
         "",
         f"- Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"- Kafka brokers: `127.0.0.1:{args.kafka_port}`",
+        f"- Task parallelism: `{args.parallelism}`",
         f"- Fixture: `official keyed bid dataset`",
         f"- Sink mode: `blackhole`",
         f"- Input rows: `{dataset_stats['total_rows']}`",
@@ -654,6 +679,19 @@ def parse_args() -> argparse.Namespace:
         help="暴露给本地 Flink runtime 使用的宿主机 Kafka 端口。",
     )
     parser.add_argument(
+        "--parallelism",
+        type=int,
+        default=1,
+        help="Flink 任务并行度。",
+    )
+    parser.add_argument(
+        "--no-cleanup",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="设为 1 时保留 Flink runtime 目录和 Kafka 数据。",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=600,
@@ -668,10 +706,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def find_free_port(start: int, end: int) -> int:
+    import socket
+
+    for port in range(start, end + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                return port
+    raise BenchError(f"cannot find a free port in range {start}-{end}")
+
+
 def main() -> int:
     args = parse_args()
     log(
-        f"Starting Flink Nexmark benchmark: dataset={args.dataset} queries={args.queries} workdir={args.workdir}"
+        f"Starting Flink Nexmark benchmark: dataset={args.dataset} queries={args.queries} "
+        f"workdir={args.workdir} kafka_port={args.kafka_port} parallelism={args.parallelism}"
     )
     workdir = Path(args.workdir).resolve()
     report_md = workdir / "report.md"
@@ -688,19 +737,22 @@ def main() -> int:
     dataset_path = Path(args.dataset).resolve()
     dataset_stats = load_bid_dataset_stats(dataset_path)
     fixture_metadata = {"dataset_path": str(dataset_path)}
-    runtime_flink, _runtime_nexmark, rest_port = create_runtime(workdir)
+    rest_port = find_free_port(18081, 18181)
+    runtime_flink, _runtime_nexmark = create_runtime(
+        workdir, args.parallelism, rest_port
+    )
     env = dict(os.environ)
     env["FLINK_HOME"] = str(runtime_flink)
     env["JAVA_TOOL_OPTIONS"] = FLINK_JAVA_OPTS
     env["_JAVA_OPTIONS"] = FLINK_JAVA_OPTS
 
-    run_cmd(
-        [str(runtime_flink / "bin" / "start-cluster.sh")],
-        cwd=runtime_flink,
-        env=env,
-        timeout=120,
-    )
     try:
+        run_cmd(
+            [str(runtime_flink / "bin" / "start-cluster.sh")],
+            cwd=runtime_flink,
+            env=env,
+            timeout=120,
+        )
         wait_for_http(rest_port, timeout=60)
         results: list[dict[str, object]] = []
         for query in queries:
@@ -709,15 +761,16 @@ def main() -> int:
             ensure_topic(args.kafka_container, topic, args.partitions)
             kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
             sql_file = workdir / f"{query.name}.sql"
-            sql_file.write_text(render_sql(topic, query), encoding="utf-8")
+            sql_file.write_text(
+                render_sql(topic, query, args.kafka_port), encoding="utf-8"
+            )
             sample_csv = workdir / f"{query.name}_samples.csv"
             monitor = MultiProcessMonitor(
                 lambda: flink_pids(runtime_flink), sample_csv, args.sample_interval
             )
-            replay_t0 = time.time()
-            monitor.start()
+            sql_proc = None
             try:
-                result = run_cmd(
+                sql_proc = subprocess.Popen(
                     [
                         str(runtime_flink / "bin" / "sql-client.sh"),
                         "embedded",
@@ -726,15 +779,26 @@ def main() -> int:
                     ],
                     cwd=workdir,
                     env=env,
-                    timeout=args.timeout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
                 )
-                job_id = parse_job_id(result.stdout)
+                job_id = read_job_id_from_proc(sql_proc, 120)
+                log(f"Flink job submitted: {job_id}")
+                replay_t0 = time.time()
+                monitor.start()
                 wait_for_group_lag_zero(
                     args.kafka_container, f"flink-{query.name}", topic, args.timeout
                 )
                 cancel_job(rest_port, job_id)
                 state = wait_for_job(rest_port, job_id, timeout=args.timeout)
             finally:
+                if sql_proc is not None:
+                    try:
+                        sql_proc.terminate()
+                        sql_proc.wait(timeout=10)
+                    except Exception:
+                        sql_proc.kill()
                 monitor.stop()
             replay_sec = time.time() - replay_t0
             avg_cpu_percent, avg_mem_gib = summarize_samples(sample_csv)
@@ -771,6 +835,7 @@ def main() -> int:
                     "fixture": "official keyed bid dataset",
                     "fixture_metadata": fixture_metadata,
                     "dataset_stats": dataset_stats,
+                    "parallelism": args.parallelism,
                     "sink_mode": "blackhole",
                     "results": results,
                 },
@@ -792,6 +857,13 @@ def main() -> int:
             text=True,
             timeout=120,
         )
+        if not args.no_cleanup:
+            runtime_root = runtime_flink.parent
+            if runtime_root.exists():
+                try:
+                    shutil.rmtree(runtime_root)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

@@ -132,6 +132,10 @@ cleanup_services() {
 	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
 }
 
+pre_cleanup() {
+	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+}
+
 trap cleanup_services EXIT
 
 wait_for_port() {
@@ -162,7 +166,7 @@ find_free_port() {
 
 prepare_workspace() {
 	log "Preparing Datalayers benchmark workspace at $work_dir"
-	cleanup_services
+	pre_cleanup
 	rm -rf "$work_dir"
 	mkdir -p "$work_dir"
 }
@@ -192,12 +196,12 @@ start_kafka() {
 	docker run -d --name "$kafka_container" \
 		--label datalayers.nexmark.bench=1 \
 		--label datalayers.nexmark.run_id="$run_id" \
-		-p "${kafka_host_port}:9092" \
+		-p "${kafka_host_port}:29092" \
 		-e KAFKA_NODE_ID=1 \
 		-e KAFKA_PROCESS_ROLES=broker,controller \
-		-e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
-		-e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:${kafka_host_port} \
-		-e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+		-e KAFKA_LISTENERS=PLAINTEXT://:9092,PLAINTEXT_HOST://:29092,CONTROLLER://:9093 \
+		-e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:9092,PLAINTEXT_HOST://127.0.0.1:${kafka_host_port} \
+		-e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT \
 		-e KAFKA_CONTROLLER_QUORUM_VOTERS=1@127.0.0.1:9093 \
 		-e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
 		-e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
@@ -209,7 +213,7 @@ start_kafka() {
 		confluentinc/cp-kafka:7.7.1 >/dev/null
 	wait_for_port 127.0.0.1 "$kafka_host_port" kafka
 	local deadline=$((SECONDS + 120))
-	until docker exec "$kafka_container" kafka-topics --bootstrap-server 127.0.0.1:9092 --list >/dev/null 2>&1; do
+	until docker logs "$kafka_container" 2>&1 | grep -q 'Kafka Server started'; do
 		if ((SECONDS >= deadline)); then
 			docker logs "$kafka_container" >&2 || true
 			echo "timeout waiting for kafka broker readiness" >&2

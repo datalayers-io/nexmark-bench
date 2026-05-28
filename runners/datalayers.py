@@ -881,15 +881,14 @@ def main() -> int:
                 if args.engine_pid is not None
                 else None
             )
+            source, pipeline = create_source_and_pipeline(
+                sql, database, topic, args.kafka_brokers, query, sink
+            )
             replay_t0 = time.time()
             log(f"Starting replay window for query {query.name}")
             if monitor is not None:
                 monitor.start()
             try:
-                # The replay window intentionally includes source and pipeline creation.
-                source, pipeline = create_source_and_pipeline(
-                    sql, database, topic, args.kafka_brokers, query, sink
-                )
                 if sink_mode == SinkMode.TABLE:
                     current_pipeline_id = pipeline_id(sql, database, pipeline)
                     group = f"datalayers-{current_pipeline_id}-group"
