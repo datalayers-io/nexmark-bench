@@ -636,6 +636,38 @@ def scan_bid_dataset(dataset_path: Path) -> dict[str, int]:
     return stats
 
 
+def dataset_stats_path(dataset_path: Path) -> Path:
+    name = dataset_path.name
+    if name.endswith(".jsonl"):
+        stats_name = name[: -len(".jsonl")] + ".stats.json"
+    else:
+        stats_name = name + ".stats.json"
+    return dataset_path.with_name(stats_name)
+
+
+def load_bid_dataset_stats(dataset_path: Path) -> dict[str, int]:
+    stats_path = dataset_stats_path(dataset_path)
+    try:
+        payload = json.loads(stats_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"dataset stats file not found for {dataset_path}: expected {stats_path}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid dataset stats JSON at {stats_path}: {exc}") from exc
+
+    required_keys = {
+        "total_rows",
+        "q2_expected_rows",
+        "q14_expected_rows",
+        "q21_expected_rows",
+    }
+    missing = sorted(required_keys - payload.keys())
+    if missing:
+        raise ValueError(f"dataset stats file {stats_path} is missing keys: {missing}")
+    return {key: int(payload[key]) for key in required_keys}
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="生成或检查共享的 Nexmark bid dataset", add_help=False
@@ -666,7 +698,7 @@ def _parse_args() -> argparse.Namespace:
     )
     prepare.add_argument(
         "--stats-output",
-        required=True,
+        default=None,
         help="dataset 统计 JSON 文件的输出路径。",
     )
     prepare.add_argument(
@@ -718,7 +750,11 @@ def main() -> int:
 
     workdir = Path(args.workdir).resolve()
     output_path = Path(args.output).resolve()
-    stats_output = Path(args.stats_output).resolve()
+    stats_output = (
+        Path(args.stats_output).resolve()
+        if args.stats_output is not None
+        else dataset_stats_path(output_path)
+    )
     result = prepare_official_bid_fixture(
         workdir=workdir,
         kafka_container=args.kafka_container,

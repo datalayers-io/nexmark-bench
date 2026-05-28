@@ -17,16 +17,19 @@ Usage:
 参数:
   --dataset PATH
       用于 Kafka preload 的 keyed JSONL dataset 路径。
+      关联的 stats 文件会按同名规则自动推导并由 runner 读取。
       默认: ./nexmark_bid.keyed.jsonl
 
   --queries LIST
       逗号分隔的 query 列表。支持: q0,q1,q2,q14,q21,q22。
+      默认: q0,q1,q2,q14,q21,q22
 
   --bench-root DIR
       benchmark 临时根目录。
 
   --no-cleanup
       保留 Kafka 容器。
+      未传时会在 bench 结束后执行 cleanup。
 
   --help
       显示本帮助信息。

@@ -46,3 +46,7 @@ tools/dlsql/static/
 __pycache__
 *.pyc
 .ruff_cache/
+
+# Generated Nexmark datasets and stats from datagen.sh.
+nexmark_bid*.jsonl
+nexmark_bid*.stats.json

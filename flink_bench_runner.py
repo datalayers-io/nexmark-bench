@@ -8,7 +8,7 @@ keyed bid JSONL dataset。当前 Flink runner 固定使用 blackhole sink。
 执行方式：
 
 1. `bench_flink.sh` 启动 Kafka，并把 Kafka 地址和工作目录传入本文件。
-2. 本文件准备 Flink toolchain，扫描现有 dataset，并计算输入行数和几个 query 的理论输出行数。
+2. 本文件准备 Flink toolchain，并读取与 dataset 关联的 stats JSON，拿到输入行数和几个 query 的理论输出行数。
 3. 对每个 query：
    - 重建独立的 Kafka topic
    - 把 keyed dataset preload 到 topic
@@ -56,7 +56,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from nexmark_fixture import prepare_flink_toolchain, scan_bid_dataset
+from nexmark_fixture import load_bid_dataset_stats, prepare_flink_toolchain
 
 
 RESET = "\033[0m"
@@ -684,7 +684,7 @@ def main() -> int:
         queries.append(spec)
 
     dataset_path = Path(args.dataset).resolve()
-    dataset_stats = scan_bid_dataset(dataset_path)
+    dataset_stats = load_bid_dataset_stats(dataset_path)
     fixture_metadata = {"dataset_path": str(dataset_path)}
     runtime_flink, _runtime_nexmark, rest_port = create_runtime(workdir)
     env = dict(os.environ)

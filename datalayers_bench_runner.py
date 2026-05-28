@@ -7,16 +7,16 @@
 
 执行方式：
 
-1. `bench_datalayers.sh` 负责启动 Kafka、本地 Datalayers 进程，并把连接参数传入本文件。
-2. 本文件扫描现有 dataset，计算输入行数和几个 query 的理论输出行数。
+1. `bench_datalayers.sh` 负责启动 Kafka，并把 Datalayers HTTP SQL 连接参数传入本文件。
+2. 本文件读取与 dataset 关联的 stats JSON，拿到输入行数和几个 query 的理论输出行数。
 3. 对每个 query：
    - 重建独立的 Kafka topic
    - 在 Datalayers 中创建 database/source/sink/pipeline
    - 把 keyed dataset preload 到 topic
    - 从 source 的 `offset='earliest'` 开始回放
-   - 在 replay 窗口内采样 Datalayers 进程的 CPU 和 RSS
+   - 在 replay 窗口内等待 query 完成
    - 根据 sink 类型等待 query 完成
-4. 每个 query 的结果会写入 `report.md`、`report.json` 和采样 CSV。
+4. 每个 query 的结果会写入 `report.md` 和 `report.json`。
 
 当前支持的完成判定：
 
@@ -30,9 +30,9 @@
 - `throughput_rps`
   定义为 `input_rows / replay_sec`，分母只包含 replay 窗口，不包含 dataset 生成或 Kafka preload。
 - `avg_cpu_percent`
-  replay 窗口内，对 Datalayers 进程做周期性 `ps` 采样后取平均值。
+  当前固定为 `0.0`，因为远端 HTTP 连接模式下不负责采样 Datalayers 进程。
 - `avg_mem_gib`
-  replay 窗口内，对 Datalayers 进程 RSS 做周期性 `ps` 采样后取平均值，并换算为 GiB。
+  当前固定为 `0.0`，因为远端 HTTP 连接模式下不负责采样 Datalayers 进程。
 - `kafka_preload_sec`
   把本轮 query 输入数据写入 Kafka topic 的耗时，单独记录，不计入 throughput 分母。
 
@@ -45,13 +45,10 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
-import os
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -63,7 +60,7 @@ import base64
 import urllib.parse
 import urllib.request
 
-from nexmark_fixture import scan_bid_dataset
+from nexmark_fixture import load_bid_dataset_stats
 
 
 RESET = "\033[0m"
@@ -243,45 +240,6 @@ def log(message: str, *, color: str | None = None) -> None:
         print(f"{color}[{now} UTC] {message}{RESET}", flush=True)
 
 
-class DatalayersSql:
-    def __init__(self, binary: str, host: str, port: int, user: str, password: str):
-        self.base_cmd = [
-            binary,
-            "-h",
-            host,
-            "-P",
-            str(port),
-            "-u",
-            user,
-            "-p",
-            password,
-        ]
-
-    def run(self, sql: str, database: str | None = None, timeout: int = 60) -> str:
-        cmd = list(self.base_cmd)
-        if database:
-            cmd.extend(["-d", database])
-        cmd.extend(["-e", sql])
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if result.returncode != 0:
-            raise BenchError(
-                result.stderr.strip() or result.stdout.strip() or "dlsql failed"
-            )
-        return result.stdout
-
-    def scalar_i64(self, sql: str, database: str) -> int:
-        output = self.run(sql, database=database)
-        for line in reversed(output.splitlines()):
-            line = line.strip()
-            if line.isdigit():
-                return int(line)
-            if line.startswith("|") and line.endswith("|"):
-                value = line.strip("| ").strip()
-                if value.isdigit():
-                    return int(value)
-        raise BenchError(f"cannot parse scalar result from output: {output}")
-
-
 class DatalayersHttpSql:
     def __init__(self, host: str, port: int, user: str, password: str):
         self.host = host
@@ -326,67 +284,6 @@ class DatalayersHttpSql:
             if isinstance(value, str) and value.isdigit():
                 return int(value)
         raise BenchError(f"cannot parse scalar result from http output: {payload}")
-
-
-class ProcessMonitor:
-    def __init__(self, pid: int, output_csv: Path, sample_interval: float):
-        self.pid = pid
-        self.output_csv = output_csv
-        self.sample_interval = sample_interval
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        self.output_csv.parent.mkdir(parents=True, exist_ok=True)
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-
-    def _run(self) -> None:
-        with self.output_csv.open("w", encoding="utf-8", newline="") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(["ts_epoch", "cpu_percent", "rss_kib"])
-            while not self._stop.is_set():
-                sample = read_process_sample(self.pid)
-                if sample is not None:
-                    writer.writerow(sample)
-                    fh.flush()
-                time.sleep(self.sample_interval)
-
-
-def read_process_sample(pid: int) -> tuple[float, float, int] | None:
-    cmd = ["ps", "-p", str(pid), "-o", "%cpu=", "-o", "rss="]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-    if result.returncode != 0:
-        return None
-    fields = result.stdout.strip().split()
-    if len(fields) < 2:
-        return None
-    try:
-        cpu_percent = float(fields[0])
-        rss_kib = int(fields[1])
-    except ValueError:
-        return None
-    return time.time(), cpu_percent, rss_kib
-
-
-def summarize_samples(path: Path) -> tuple[float, float]:
-    cpu_values: list[float] = []
-    rss_values: list[int] = []
-    with path.open("r", encoding="utf-8", newline="") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            cpu_values.append(float(row["cpu_percent"]))
-            rss_values.append(int(row["rss_kib"]))
-    if not cpu_values or not rss_values:
-        return 0.0, 0.0
-    avg_cpu = sum(cpu_values) / len(cpu_values)
-    avg_mem_gib = (sum(rss_values) / len(rss_values)) / 1024 / 1024
-    return avg_cpu, avg_mem_gib
 
 
 def run_cmd(cmd: list[str], input_path: Path | None = None, timeout: int = 300) -> None:
@@ -478,7 +375,7 @@ def load_topic(container: str, topic: str, dataset_path: Path) -> float:
 
 
 def wait_for_count(
-    sql: DatalayersSql, database: str, table: str, expected_rows: int, timeout: int
+    sql: DatalayersHttpSql, database: str, table: str, expected_rows: int, timeout: int
 ) -> tuple[int, float]:
     # Table sink completion is defined as "the sink table has observed at least the expected
     # number of output rows for the current query semantics".
@@ -549,7 +446,7 @@ def wait_for_group_lag_zero(
         time.sleep(1)
 
 
-def pipeline_state(sql: DatalayersSql, database: str, pipeline: str) -> str:
+def pipeline_state(sql: DatalayersHttpSql, database: str, pipeline: str) -> str:
     output = sql.run(
         f"SELECT state FROM information_schema.pipelines WHERE pipeline_name = '{pipeline}'",
         database=database,
@@ -561,13 +458,13 @@ def pipeline_state(sql: DatalayersSql, database: str, pipeline: str) -> str:
     return "Unknown"
 
 
-def create_database(sql: DatalayersSql, database: str) -> None:
+def create_database(sql: DatalayersHttpSql, database: str) -> None:
     log(f"Creating benchmark database {database}")
     sql.run(f"CREATE DATABASE IF NOT EXISTS {database}")
 
 
 def create_table_sink(
-    sql: DatalayersSql,
+    sql: DatalayersHttpSql,
     database: str,
     query: QuerySpec,
 ) -> str:
@@ -586,14 +483,16 @@ def create_table_sink(
     return sink
 
 
-def create_blackhole_sink(sql: DatalayersSql, database: str, query: QuerySpec) -> str:
+def create_blackhole_sink(
+    sql: DatalayersHttpSql, database: str, query: QuerySpec
+) -> str:
     sink = f"{query.name}_bh"
     sql.run(f"CREATE SINK {sink} WITH (connector='blackhole')", database=database)
     return sink
 
 
 def create_source_and_pipeline(
-    sql: DatalayersSql,
+    sql: DatalayersHttpSql,
     database: str,
     topic: str,
     kafka_brokers: str,
@@ -641,7 +540,7 @@ def create_source_and_pipeline(
     return source, pipeline
 
 
-def pipeline_id(sql: DatalayersSql, database: str, pipeline: str) -> int:
+def pipeline_id(sql: DatalayersHttpSql, database: str, pipeline: str) -> int:
     return sql.scalar_i64(
         f"SELECT pipeline_id FROM information_schema.pipelines WHERE pipeline_name = '{pipeline}'",
         database,
@@ -649,7 +548,7 @@ def pipeline_id(sql: DatalayersSql, database: str, pipeline: str) -> int:
 
 
 def cleanup_objects(
-    sql: DatalayersSql,
+    sql: DatalayersHttpSql,
     database: str,
     source: str,
     sink: str,
@@ -675,6 +574,37 @@ def cleanup_objects(
         sql.run(f"DROP DATABASE {database}")
     except Exception:
         pass
+
+
+def preclean_benchmark_databases(
+    sql: DatalayersHttpSql, queries: list[QuerySpec], sink_mode: SinkMode
+) -> None:
+    for query in queries:
+        database = f"nexmark_{query.name}"
+        source = f"{query.name}_src"
+        pipeline = f"{query.name}_pipeline"
+        sink = (
+            f"{query.name}_sink" if sink_mode == SinkMode.TABLE else f"{query.name}_bh"
+        )
+        log(f"Pre-cleaning stale Datalayers objects in {database}")
+        statements = [
+            f"ALTER PIPELINE {pipeline} STOP",
+            f"DROP PIPELINE {pipeline}",
+        ]
+        if sink_mode == SinkMode.TABLE:
+            statements.append(f"DROP TABLE {sink}")
+        else:
+            statements.append(f"DROP SINK {sink}")
+        statements.append(f"DROP SOURCE {source}")
+        for statement in statements:
+            try:
+                sql.run(statement, database=database)
+            except Exception:
+                pass
+        try:
+            sql.run(f"DROP DATABASE {database}")
+        except Exception:
+            pass
 
 
 def markdown_report(
@@ -742,28 +672,10 @@ def parse_args() -> argparse.Namespace:
     parser._positionals.title = "位置参数"
     parser._optionals.title = "可选参数"
     parser.add_argument(
-        "--sql-mode",
-        choices=["dlsql", "http"],
-        default="dlsql",
-        help="连接 Datalayers 时使用的 SQL 通道：dlsql 走 SQL 端口，http 走 HTTP SQL endpoint。",
+        "--host", default="127.0.0.1", help="Datalayers HTTP SQL host。"
     )
     parser.add_argument(
-        "--dlsql",
-        default=os.environ.get("DLSQL_BIN", "target/reldev/dlsql"),
-        help="dlsql 可执行文件路径，仅在 --sql-mode=dlsql 时使用。",
-    )
-    parser.add_argument("--host", default="127.0.0.1", help="Datalayers SQL host。")
-    parser.add_argument("--port", type=int, default=19360, help="Datalayers SQL 端口。")
-    parser.add_argument(
-        "--http-host",
-        default="127.0.0.1",
-        help="--sql-mode=http 时使用的 HTTP SQL host。",
-    )
-    parser.add_argument(
-        "--http-port",
-        type=int,
-        default=8361,
-        help="--sql-mode=http 时使用的 HTTP SQL 端口。",
+        "--port", type=int, default=8361, help="Datalayers HTTP SQL 端口。"
     )
     parser.add_argument("--user", default="admin", help="Datalayers 用户名。")
     parser.add_argument("--password", default="public", help="Datalayers 密码。")
@@ -780,7 +692,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workdir",
         default=".datalayers-nexmark",
-        help="报告、采样 CSV 和中间文件的工作目录。",
+        help="报告和中间文件的工作目录。",
     )
     parser.add_argument(
         "--dataset",
@@ -806,24 +718,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         choices=[0, 1],
         default=0,
-        help="设为 1 时保留 benchmark 创建的 SQL 对象。",
+        help="设为 1 时保留 benchmark 创建的 SQL 对象和 Kafka topic 数据。",
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=600,
         help="每个 query 的完成等待超时时间，单位秒。",
-    )
-    parser.add_argument(
-        "--engine-pid",
-        type=int,
-        help="待采样的 Datalayers 进程 PID；未提供时不采样 CPU 和内存。",
-    )
-    parser.add_argument(
-        "--sample-interval",
-        type=float,
-        default=1.0,
-        help="CPU 和 RSS 采样间隔，单位秒。",
     )
     return parser.parse_args()
 
@@ -832,7 +733,7 @@ def main() -> int:
     args = parse_args()
     log(
         f"Starting Datalayers Nexmark benchmark: dataset={args.dataset} queries={args.queries} "
-        f"sink={args.sink} sql_mode={args.sql_mode} workdir={args.workdir}"
+        f"sink={args.sink} host={args.host} port={args.port} workdir={args.workdir}"
     )
     workdir = Path(args.workdir).resolve()
     report_md = workdir / "report.md"
@@ -854,19 +755,13 @@ def main() -> int:
         )
     sink_mode = SinkMode(args.sink)
 
-    if args.sql_mode == "dlsql":
-        sql: DatalayersSql | DatalayersHttpSql = DatalayersSql(
-            args.dlsql, args.host, args.port, args.user, args.password
-        )
-    else:
-        sql = DatalayersHttpSql(
-            args.http_host, args.http_port, args.user, args.password
-        )
+    sql = DatalayersHttpSql(args.host, args.port, args.user, args.password)
     workdir.mkdir(parents=True, exist_ok=True)
 
     dataset_path = Path(args.dataset).resolve()
-    dataset_stats = scan_bid_dataset(dataset_path)
+    dataset_stats = load_bid_dataset_stats(dataset_path)
     fixture_metadata = {"dataset_path": str(dataset_path)}
+    preclean_benchmark_databases(sql, queries, sink_mode)
 
     results: list[dict[str, object]] = []
     for query in queries:
@@ -885,41 +780,26 @@ def main() -> int:
                 sink = create_blackhole_sink(sql, database, query)
             kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
             expected_rows = query.expected_rows(dataset_stats)
-            sample_csv = workdir / f"{query.name}_samples.csv"
-            monitor = (
-                ProcessMonitor(args.engine_pid, sample_csv, args.sample_interval)
-                if args.engine_pid is not None
-                else None
-            )
             replay_t0 = time.time()
             log(f"Starting replay window for query {query.name}")
-            if monitor is not None:
-                monitor.start()
-            try:
-                # The replay window intentionally includes source and pipeline creation.
-                source, pipeline = create_source_and_pipeline(
-                    sql, database, topic, args.kafka_brokers, query, sink
+            # The replay window intentionally includes source and pipeline creation.
+            source, pipeline = create_source_and_pipeline(
+                sql, database, topic, args.kafka_brokers, query, sink
+            )
+            if sink_mode == SinkMode.TABLE:
+                inserted_rows, _ = wait_for_count(
+                    sql, database, sink, expected_rows, args.timeout
                 )
-                if sink_mode == SinkMode.TABLE:
-                    inserted_rows, _ = wait_for_count(
-                        sql, database, sink, expected_rows, args.timeout
-                    )
-                else:
-                    current_pipeline_id = pipeline_id(sql, database, pipeline)
-                    group = f"datalayers-{current_pipeline_id}-group"
-                    inserted_rows, _ = wait_for_group_lag_zero(
-                        args.kafka_container, group, topic, args.timeout
-                    )
-                    inserted_rows = expected_rows
-            finally:
-                if monitor is not None:
-                    monitor.stop()
+            else:
+                current_pipeline_id = pipeline_id(sql, database, pipeline)
+                group = f"datalayers-{current_pipeline_id}-group"
+                inserted_rows, _ = wait_for_group_lag_zero(
+                    args.kafka_container, group, topic, args.timeout
+                )
+                inserted_rows = expected_rows
             replay_t1 = time.time()
             replay_sec = replay_t1 - replay_t0
-            if monitor is not None:
-                avg_cpu_percent, avg_mem_gib = summarize_samples(sample_csv)
-            else:
-                avg_cpu_percent, avg_mem_gib = 0.0, 0.0
+            avg_cpu_percent, avg_mem_gib = 0.0, 0.0
             state = pipeline_state(sql, database, pipeline)
             log(
                 f"Finished benchmark for query {query.name}: inserted_rows={inserted_rows} "
@@ -941,7 +821,6 @@ def main() -> int:
                     "kafka_preload_sec": round(kafka_preload_sec, 3),
                     "sink_mode": sink_mode.value,
                     "state": state,
-                    "sample_csv": str(sample_csv),
                 }
             )
         finally:

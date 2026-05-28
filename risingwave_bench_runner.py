@@ -8,7 +8,7 @@
 执行方式：
 
 1. `bench_risingwave.sh` 负责启动 Kafka、RisingWave standalone 容器，并把连接参数传入本文件。
-2. 本文件扫描现有 dataset，计算输入行数和几个 query 的理论输出行数。
+2. 本文件读取与 dataset 关联的 stats JSON，拿到输入行数和几个 query 的理论输出行数。
 3. 对每个 query：
    - 重建独立的 Kafka topic
    - 把 keyed dataset preload 到 topic
@@ -59,7 +59,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-from nexmark_fixture import scan_bid_dataset
+from nexmark_fixture import load_bid_dataset_stats
 
 
 RESET = "\033[0m"
@@ -657,7 +657,7 @@ def main() -> int:
     sql = RisingWaveSql(args.host, args.port, args.user, args.database)
     workdir.mkdir(parents=True, exist_ok=True)
     dataset_path = Path(args.dataset).resolve()
-    dataset_stats = scan_bid_dataset(dataset_path)
+    dataset_stats = load_bid_dataset_stats(dataset_path)
     fixture_metadata = {"dataset_path": str(dataset_path)}
 
     results: list[dict[str, object]] = []

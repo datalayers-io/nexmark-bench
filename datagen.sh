@@ -11,13 +11,12 @@ usage() {
 生成可复用的 Nexmark keyed bid dataset。
 
 Usage:
-  datagen.sh [--dataset PATH] [--stats-output PATH] [--rows N] [--partitions N]
-             [--bench-root DIR] [--no-cleanup]
+  datagen.sh [--dataset PATH] [--rows N] [--partitions N] [--bench-root DIR]
+             [--no-cleanup]
 
 参数:
   --dataset PATH       输出 keyed JSONL dataset 的路径。默认: ./nexmark_bid.keyed.jsonl
-  --stats-output PATH  输出 dataset 统计 JSON 的路径。默认: ./nexmark_bid.stats.json
-  --rows N             目标 bid 行数。
+  --rows N             目标 bid 行数。默认: 1000000（100 万行）
   --partitions N       写 keyed dataset 时使用的逻辑 key 数量。
   --bench-root DIR     生成 dataset 时使用的临时工作根目录。
   --no-cleanup         保留临时 Kafka 容器和工作目录。
@@ -35,18 +34,26 @@ log() {
 rows="1000000"
 partitions="4"
 dataset_path="$project_root/nexmark_bid.keyed.jsonl"
-stats_output="$project_root/nexmark_bid.stats.json"
 no_cleanup="0"
 bench_root=""
+
+stats_path_for_dataset() {
+	local dataset="$1"
+	local dir base stem
+	dir="$(dirname "$dataset")"
+	base="$(basename "$dataset")"
+	if [[ "$base" == *.jsonl ]]; then
+		stem="${base%.jsonl}"
+		printf '%s/%s.stats.json\n' "$dir" "$stem"
+	else
+		printf '%s/%s.stats.json\n' "$dir" "$base"
+	fi
+}
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--dataset)
 		dataset_path="$2"
-		shift 2
-		;;
-	--stats-output)
-		stats_output="$2"
 		shift 2
 		;;
 	--rows)
@@ -163,8 +170,9 @@ start_kafka() {
 }
 
 run_datagen() {
-	local dataset_abs stats_abs
+	local dataset_abs stats_output stats_abs
 	dataset_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$dataset_path")"
+	stats_output="$(stats_path_for_dataset "$dataset_path")"
 	stats_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$stats_output")"
 	log "Generating keyed dataset into $dataset_abs"
 	python3 ./nexmark_fixture.py prepare \
@@ -184,5 +192,5 @@ start_kafka
 run_datagen
 
 echo "dataset: $dataset_path"
-echo "stats:   $stats_output"
+echo "stats:   $(stats_path_for_dataset "$dataset_path")"
 echo "root:    $bench_root"
