@@ -45,22 +45,24 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import json
+import os
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-import base64
-import urllib.parse
-import urllib.request
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nexmark_fixture import load_bid_dataset_stats
 

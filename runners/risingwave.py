@@ -60,6 +60,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from nexmark_fixture import load_bid_dataset_stats
 
 

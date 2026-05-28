@@ -22,8 +22,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -33,6 +35,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nexmark_fixture import load_bid_dataset_stats
 
