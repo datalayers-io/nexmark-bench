@@ -13,7 +13,7 @@ usage() {
 
 Usage:
   bench_arroyo.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22]
-                  [--bench-root DIR] [--no-cleanup] [--image IMAGE]
+                  [--parallelism N] [--bench-root DIR] [--no-cleanup] [--image IMAGE]
 
 参数:
   --dataset PATH
@@ -27,6 +27,10 @@ Usage:
 
   --bench-root DIR
       benchmark 临时根目录。
+
+  --parallelism N
+      Arroyo pipeline 并行度。
+      默认: 1
 
   --no-cleanup
       保留 Kafka、Arroyo 容器、network 和 benchmark 创建的 pipeline。
@@ -52,6 +56,7 @@ no_cleanup="0"
 bench_root=""
 arroyo_image="${ARROYO_IMAGE:-ghcr.io/arroyosystems/arroyo:0.14.1}"
 dataset="$project_root/nexmark_bid.keyed.jsonl"
+parallelism="1"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -65,6 +70,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--bench-root)
 		bench_root="$2"
+		shift 2
+		;;
+	--parallelism)
+		parallelism="$2"
 		shift 2
 		;;
 	--no-cleanup)
@@ -213,7 +222,7 @@ start_arroyo() {
 }
 
 run_bench() {
-	log "Running Arroyo Nexmark benchmark: dataset=$dataset queries=$queries image=$arroyo_image"
+	log "Running Arroyo Nexmark benchmark: dataset=$dataset queries=$queries parallelism=$parallelism image=$arroyo_image"
 	python3 ./arroyo_bench_runner.py \
 		--host 127.0.0.1 \
 		--port "$arroyo_host_port" \
@@ -222,6 +231,7 @@ run_bench() {
 		--workdir "$work_dir" \
 		--dataset "$dataset" \
 		--queries "$queries" \
+		--parallelism "$parallelism" \
 		--arroyo-container "$arroyo_container" \
 		--no-cleanup "$no_cleanup"
 	log "Arroyo Nexmark benchmark finished"

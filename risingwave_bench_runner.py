@@ -48,6 +48,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -65,6 +66,7 @@ from nexmark_fixture import load_bid_dataset_stats
 RESET = "\033[0m"
 GREEN = "\033[32m"
 RW_GROUP_ID_PREFIX = "nexmark-rw-consumer"
+RW_METRIC_NAME = "stream_sink_input_row_count"
 
 
 @dataclass
@@ -403,11 +405,31 @@ def wait_for_count(
         f"and Kafka group `{group}` to finish consuming topic `{topic}`"
     )
     start = time.time()
+    stable_count_polls = 0
+    previous_count: int | None = None
+    fallback_logged = False
     while True:
         count = sql.scalar_i64(f"SELECT COUNT(*) FROM {table}")
         drained, rows = kafka_group_drained(container, group, topic)
         if count >= expected_rows and drained:
             return count
+        if count >= expected_rows and not rows:
+            if previous_count == count:
+                stable_count_polls += 1
+            else:
+                stable_count_polls = 1
+                previous_count = count
+            if stable_count_polls >= 3:
+                if not fallback_logged:
+                    log(
+                        f"Kafka group `{group}` is unavailable; falling back to stable COUNT(*) "
+                        f"completion for materialized view {table}"
+                    )
+                    fallback_logged = True
+                return count
+        else:
+            stable_count_polls = 0
+            previous_count = count
         if time.time() - start > timeout:
             raise BenchError(
                 f"timeout waiting for {table} count>={expected_rows} and kafka group to drain, "
@@ -486,6 +508,143 @@ def wait_for_group_lag_zero(
         time.sleep(1)
 
 
+def sink_id(sql: RisingWaveSql, sink: str) -> int:
+    return sql.scalar_i64(
+        f"SELECT id FROM rw_catalog.rw_sinks WHERE name = '{sink}'",
+        timeout=30,
+    )
+
+
+def metrics_ports(container: str) -> list[int]:
+    result = subprocess.run(
+        [
+            "docker",
+            "exec",
+            container,
+            "bash",
+            "-lc",
+            "ss -ltnH | awk '{print $4}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise BenchError(
+            result.stderr.strip() or result.stdout.strip() or "cannot inspect ports"
+        )
+    ports: list[int] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        port_text = line.rsplit(":", 1)[-1]
+        if not port_text.isdigit():
+            continue
+        port = int(port_text)
+        if port not in ports:
+            ports.append(port)
+    preferred = [1222, 1260]
+    for port in preferred:
+        if port not in ports:
+            ports.append(port)
+    ports.sort(
+        key=lambda port: (
+            port not in preferred,
+            preferred.index(port) if port in preferred else port,
+        )
+    )
+    if not ports:
+        ports = preferred.copy()
+    return ports
+
+
+def metrics_text(container: str) -> str:
+    errors: list[str] = []
+    for port in metrics_ports(container):
+        result = subprocess.run(
+            [
+                "docker",
+                "exec",
+                container,
+                "bash",
+                "-lc",
+                (
+                    f"curl -fsS --max-time 3 http://127.0.0.1:{port}/metrics "
+                    f"|| wget -qO- http://127.0.0.1:{port}/metrics"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            errors.append(
+                f"{port}: {result.stderr.strip() or result.stdout.strip() or 'request failed'}"
+            )
+            continue
+        body = result.stdout
+        if RW_METRIC_NAME in body:
+            return body
+    raise BenchError(
+        "cannot fetch RisingWave metrics containing "
+        f"{RW_METRIC_NAME} from container {container}: {'; '.join(errors)}"
+    )
+
+
+def sink_input_row_count(container: str, sink_id_value: int) -> int:
+    pattern = re.compile(
+        rf'^{RW_METRIC_NAME}\{{[^}}]*sink_id="{sink_id_value}"[^}}]*\}}\s+(\d+)$'
+    )
+    total = 0
+    matched = False
+    for line in metrics_text(container).splitlines():
+        match = pattern.match(line.strip())
+        if match is None:
+            continue
+        matched = True
+        total += int(match.group(1))
+    if not matched:
+        raise BenchError(
+            f"metric {RW_METRIC_NAME} for sink_id={sink_id_value} not found in RisingWave metrics"
+        )
+    return total
+
+
+def wait_for_sink_input_rows(
+    container: str,
+    sink_name: str,
+    sink_id_value: int,
+    expected_rows: int,
+    timeout: int,
+) -> int:
+    log(
+        f"Waiting for blackhole sink {sink_name} to consume {expected_rows} rows "
+        f"via RisingWave metric `{RW_METRIC_NAME}`"
+    )
+    start = time.time()
+    stable_polls = 0
+    last_count: int | None = None
+    while True:
+        count = sink_input_row_count(container, sink_id_value)
+        if count >= expected_rows:
+            if count == last_count:
+                stable_polls += 1
+            else:
+                stable_polls = 1
+                last_count = count
+            if stable_polls >= 3:
+                return count
+        else:
+            stable_polls = 0
+            last_count = count
+        if time.time() - start > timeout:
+            raise BenchError(
+                f"timeout waiting for sink {sink_name} metric rows>={expected_rows}, current={count}"
+            )
+        time.sleep(1)
+
+
 def create_source(
     sql: RisingWaveSql,
     source: str,
@@ -503,12 +662,13 @@ def create_source(
             price BIGINT,
             channel VARCHAR,
             url VARCHAR,
-            ts TIMESTAMPTZ,
+            ts TIMESTAMP,
             extra VARCHAR
         ) WITH (
             connector = 'kafka',
             topic = '{topic}',
             properties.bootstrap.server = '{kafka_brokers}',
+            properties.enable.auto.commit = 'true',
             group.id.prefix = '{group_id_prefix}',
             scan.startup.mode = 'earliest'
         ) FORMAT PLAIN ENCODE JSON
@@ -615,8 +775,8 @@ def markdown_report(
             "## Notes",
             "",
             "- This benchmark samples the standalone RisingWave container main process during the replay window.",
-            "- `sink=table` maps to a RisingWave materialized view and waits on both `COUNT(*)` and Kafka consumer lag reaching 0.",
-            "- `sink=blackhole` creates a RisingWave blackhole sink and waits on Kafka consumer lag reaching 0.",
+            "- `sink=table` maps to a RisingWave materialized view and waits on `COUNT(*)` plus a best-effort Kafka drain signal; if the Kafka group is unavailable, it falls back to stable `COUNT(*)` completion.",
+            "- `sink=blackhole` creates a RisingWave blackhole sink and waits on the `stream_sink_input_row_count` metric for that sink.",
             "- `throughput` is computed as input rows divided by replay time.",
         ]
     )
@@ -672,7 +832,7 @@ def parse_args() -> argparse.Namespace:
         "--sink",
         choices=[mode.value for mode in SinkMode],
         default=SinkMode.TABLE.value,
-        help="sink 类型：table 通过行数判定完成，blackhole 通过 lag 判定完成。",
+        help="sink 类型：table 通过 count 判定，blackhole 通过 sink input row metric 判定。",
     )
     parser.add_argument(
         "--no-cleanup",
@@ -771,10 +931,14 @@ def main() -> int:
                     )
                 else:
                     create_blackhole_sink(sql, target, source, query)
-                    wait_for_group_lag_zero(
-                        args.kafka_container, group, topic, args.timeout
+                    target_sink_id = sink_id(sql, target)
+                    inserted_rows = wait_for_sink_input_rows(
+                        args.rw_container,
+                        target,
+                        target_sink_id,
+                        expected_rows,
+                        args.timeout,
                     )
-                    inserted_rows = expected_rows
             finally:
                 monitor.stop()
             replay_t1 = time.time()

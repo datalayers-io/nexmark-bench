@@ -566,6 +566,7 @@ def markdown_report(
         f"- Arroyo container: `{args.arroyo_container}`",
         f"- Kafka brokers in Arroyo: `{args.kafka_brokers}`",
         f"- Topic partitions: `{args.partitions}`",
+        f"- Pipeline parallelism: `{args.parallelism}`",
         f"- Fixture: `official keyed bid dataset`",
         f"- Sink mode: `blackhole`",
         f"- Input rows: `{dataset_stats['total_rows']}`",
@@ -641,6 +642,12 @@ def parse_args() -> argparse.Namespace:
         help="逗号分隔的 query 列表。",
     )
     parser.add_argument(
+        "--parallelism",
+        type=int,
+        default=1,
+        help="Arroyo pipeline 并行度。",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=600,
@@ -692,6 +699,8 @@ def main() -> int:
     dataset_path = Path(args.dataset).resolve()
     dataset_stats = load_bid_dataset_stats(dataset_path)
     fixture_metadata = {"dataset_path": str(dataset_path)}
+    if args.parallelism < 1:
+        raise BenchError("--parallelism must be >= 1")
 
     results: list[dict[str, object]] = []
     for query in queries:
@@ -722,7 +731,7 @@ def main() -> int:
                     {
                         "name": pipeline_name,
                         "query": sql,
-                        "parallelism": 1,
+                        "parallelism": args.parallelism,
                         "checkpoint_interval_micros": 24 * 60 * 60 * 1_000_000,
                     },
                     timeout=120,
@@ -795,6 +804,7 @@ def main() -> int:
                 "fixture": "official keyed bid dataset",
                 "fixture_metadata": fixture_metadata,
                 "dataset_stats": dataset_stats,
+                "parallelism": args.parallelism,
                 "sink_mode": "blackhole",
                 "results": results,
             },

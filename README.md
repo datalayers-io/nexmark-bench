@@ -143,8 +143,8 @@ bash ./bench_arroyo.sh \
 - `--parallelism N`
   RisingWave `single_node` 的并行度。
 - `--sink table|blackhole`
-  `table` 创建 materialized view，并通过 `COUNT(*) >= expected_rows` 且 Kafka source group 进入稳定 drain 状态共同判定完成。
-  `blackhole` 创建 blackhole sink，并通过 Kafka source group 进入稳定 drain 状态判定完成。
+  `table` 创建 materialized view，并通过 `COUNT(*) >= expected_rows` 判定完成；runner 会额外尝试用 Kafka source group 作为兜底信号，如果该信号不可用，则回退到稳定的 `COUNT(*)`。
+  `blackhole` 创建 blackhole sink，并通过 RisingWave metrics 中该 sink 的 `stream_sink_input_row_count >= expected_rows` 判定完成。
 - `--bench-root DIR`
   本次 benchmark 的临时根目录。
 - `--no-cleanup`
@@ -160,6 +160,8 @@ bash ./bench_arroyo.sh \
   keyed JSONL dataset 路径。默认指向仓库根目录下的稳定 dataset。runner 会自动读取与其同名关联的 stats JSON。
 - `--queries LIST`
   逗号分隔 query 列表。
+- `--parallelism N`
+  Arroyo pipeline 并行度。
 - `--bench-root DIR`
   本次 benchmark 的临时根目录。
 - `--no-cleanup`
@@ -184,7 +186,9 @@ Flink runner 固定使用 blackhole sink。完成判定是 Kafka consumer group 
 - `--image IMAGE`
   覆盖默认 Arroyo 镜像。当前默认值是 `ghcr.io/arroyosystems/arroyo:0.14.1`。
 
-Arroyo runner 当前固定使用 blackhole sink。完成判定基于每个 query 显式指定的 Kafka source consumer group；由于 Arroyo 对 Kafka group 提交的是“最后已处理 offset”，完成时在 `kafka-consumer-groups` 里可能表现为每个非空分区残留 `lag=1`，runner 已按这个语义做了兜底判定。
+Arroyo runner 当前支持 `--parallelism`，会直接透传到 `/pipelines` API 的 `parallelism` 字段。sink 仍固定为 blackhole。原因是 Arroyo 目前虽然支持 `CREATE TABLE ... WITH (...)`、`INSERT INTO ... SELECT ...` 和 preview pipeline，但没有像 Datalayers/RisingWave 那样适合 benchmark 轮询 `SELECT COUNT(*)` 的内建结果表；preview sink 会把完整输出流推给 API，更适合调试，不适合 100 万行 replay benchmark。
+
+Arroyo 的完成判定仍基于每个 query 显式指定的 Kafka source consumer group；由于 Arroyo 对 Kafka group 提交的是“最后已处理 offset”，完成时在 `kafka-consumer-groups` 里可能表现为每个非空分区残留 `lag=1`，runner 已按这个语义做了兜底判定。
 
 ## 指标口径
 
