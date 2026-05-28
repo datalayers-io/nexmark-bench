@@ -27,6 +27,9 @@ Usage:
 
   --parallelism N
       RisingWave `single_node` 的并行度。
+      默认: 1。
+      注意: RisingWave v2.x 默认镜像的 license 限制为 4 个 computing unit，
+      设置为大于 4 的值不会生效。建议 scope: 1-4。
 
   --sink MODE
       `table` 创建 materialized view，并通过行数判定完成。

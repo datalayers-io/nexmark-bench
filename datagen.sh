@@ -16,7 +16,7 @@ Usage:
 
 参数:
   --dataset PATH       输出 keyed JSONL dataset 的路径。默认: ./nexmark_bid.keyed.jsonl
-  --rows N             目标 bid 行数。默认: 1000000（100 万行）
+  --rows N             目标 bid 行数。默认: 5000000（500 万行）
   --partitions N       写 keyed dataset 时使用的逻辑 key 数量。
   --bench-root DIR     生成 dataset 时使用的临时工作根目录。
   --no-cleanup         保留临时 Kafka 容器和工作目录。
@@ -31,7 +31,7 @@ log() {
 	printf '[%s UTC] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$1"
 }
 
-rows="1000000"
+rows="5000000"
 partitions="4"
 dataset_path="$project_root/nexmark_bid.keyed.jsonl"
 no_cleanup="0"

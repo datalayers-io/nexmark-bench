@@ -168,6 +168,36 @@ QUERY_SPECS: dict[str, QuerySpec] = {
         """,
         expected_rows=lambda stats: stats["total_rows"],
     ),
+    "q16": QuerySpec(
+        name="q16",
+        select_sql="""
+            SELECT channel,
+                   count(*) AS total_bids,
+                   min(price) AS min_price,
+                   max(price) AS max_price,
+                   avg(price) AS avg_price,
+                   count(distinct bidder) AS distinct_bidders,
+                   count(distinct auction) AS distinct_auctions
+            FROM {source}
+            GROUP BY channel
+        """,
+        expected_rows=lambda stats: stats["q16_expected_rows"],
+    ),
+    "q17": QuerySpec(
+        name="q17",
+        select_sql="""
+            SELECT auction,
+                   count(*) AS bid_count,
+                   min(price) AS min_price,
+                   max(price) AS max_price,
+                   avg(price) AS avg_price,
+                   sum(price) AS sum_price,
+                   count(distinct bidder) AS distinct_bidders
+            FROM {source}
+            GROUP BY auction
+        """,
+        expected_rows=lambda stats: stats["q17_expected_rows"],
+    ),
 }
 
 
@@ -596,20 +626,18 @@ def metrics_text(container: str) -> str:
 
 def sink_input_row_count(container: str, sink_id_value: int) -> int:
     pattern = re.compile(
-        rf'^{RW_METRIC_NAME}\{{[^}}]*sink_id="{sink_id_value}"[^}}]*\}}\s+(\d+)$'
+        rf'^{RW_METRIC_NAME}\{{[^}}]*sink_id="{sink_id_value}"(?:,|}})[^}}]*\}}\s+(\d+)$'
     )
     total = 0
-    matched = False
-    for line in metrics_text(container).splitlines():
+    try:
+        body = metrics_text(container)
+    except BenchError:
+        return 0
+    for line in body.splitlines():
         match = pattern.match(line.strip())
         if match is None:
             continue
-        matched = True
         total += int(match.group(1))
-    if not matched:
-        raise BenchError(
-            f"metric {RW_METRIC_NAME} for sink_id={sink_id_value} not found in RisingWave metrics"
-        )
     return total
 
 

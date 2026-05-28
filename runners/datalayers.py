@@ -77,6 +77,7 @@ class QuerySpec:
     sink_columns: str
     select_sql: str
     expected_rows: Callable[[dict[str, int]], int]
+    unsupported: bool = False
 
 
 QUERY_SPECS: dict[str, QuerySpec] = {
@@ -223,6 +224,20 @@ QUERY_SPECS: dict[str, QuerySpec] = {
             FROM {source}
         """,
         expected_rows=lambda stats: stats["total_rows"],
+    ),
+    "q16": QuerySpec(
+        name="q16",
+        sink_columns="",
+        select_sql="",
+        expected_rows=lambda stats: stats.get("q16_expected_rows", 0),
+        unsupported=True,
+    ),
+    "q17": QuerySpec(
+        name="q17",
+        sink_columns="",
+        select_sql="",
+        expected_rows=lambda stats: stats.get("q17_expected_rows", 0),
+        unsupported=True,
     ),
 }
 
@@ -860,6 +875,25 @@ def main() -> int:
 
     results: list[dict[str, object]] = []
     for query in queries:
+        if query.unsupported:
+            log(f"Skipping unsupported query {query.name} for Datalayers", color=GREEN)
+            results.append(
+                {
+                    "query": query.name,
+                    "input_rows": dataset_stats["total_rows"],
+                    "expected_rows": "N/A",
+                    "inserted_rows": "N/A",
+                    "replay_sec": "N/A",
+                    "throughput_rps": "N/A",
+                    "avg_cpu_percent": "N/A",
+                    "avg_mem_gib": "N/A",
+                    "kafka_preload_sec": "N/A",
+                    "sink_mode": sink_mode.value,
+                    "state": "N/A",
+                    "sample_csv": "N/A",
+                }
+            )
+            continue
         log(f"Starting benchmark for query {query.name}", color=GREEN)
         topic = f"nexmark_{query.name}"
         database = f"nexmark_{query.name}"

@@ -51,6 +51,7 @@ class QuerySpec:
     sink_columns: str
     select_sql: str
     expected_rows: Callable[[dict[str, int]], int]
+    updating: bool = False
 
 
 QUERY_SPECS: dict[str, QuerySpec] = {
@@ -191,6 +192,58 @@ QUERY_SPECS: dict[str, QuerySpec] = {
             FROM {source}
         """,
         expected_rows=lambda stats: stats["total_rows"],
+    ),
+    "q16": QuerySpec(
+        name="q16",
+        sink_columns="""
+            channel TEXT,
+            total_bids BIGINT,
+            min_price BIGINT,
+            max_price BIGINT,
+            avg_price DOUBLE,
+            distinct_bidders BIGINT,
+            distinct_auctions BIGINT
+        """,
+        select_sql="""
+            SELECT
+                channel,
+                count(*) AS total_bids,
+                min(price) AS min_price,
+                max(price) AS max_price,
+                CAST(avg(price) AS DOUBLE) AS avg_price,
+                count(distinct bidder) AS distinct_bidders,
+                count(distinct auction) AS distinct_auctions
+            FROM {source}
+            GROUP BY channel
+        """,
+        expected_rows=lambda stats: stats["q16_expected_rows"],
+        updating=True,
+    ),
+    "q17": QuerySpec(
+        name="q17",
+        sink_columns="""
+            auction BIGINT,
+            bid_count BIGINT,
+            min_price BIGINT,
+            max_price BIGINT,
+            avg_price DOUBLE,
+            sum_price BIGINT,
+            distinct_bidders BIGINT
+        """,
+        select_sql="""
+            SELECT
+                auction,
+                count(*) AS bid_count,
+                min(price) AS min_price,
+                max(price) AS max_price,
+                CAST(avg(price) AS DOUBLE) AS avg_price,
+                sum(price) AS sum_price,
+                count(distinct bidder) AS distinct_bidders
+            FROM {source}
+            GROUP BY auction
+        """,
+        expected_rows=lambda stats: stats["q17_expected_rows"],
+        updating=True,
     ),
 }
 
@@ -528,7 +581,8 @@ def render_sql(
     group_id: str,
     sink_mode: str,
 ) -> str:
-    if sink_mode == "blackhole":
+    effective_sink = "table" if query.updating else sink_mode
+    if effective_sink == "blackhole":
         sink_ddl = f"""
 CREATE TABLE {sink_name} (
   {query.sink_columns}

@@ -224,7 +224,7 @@ start_arroyo() {
 		--label arroyo.nexmark.bench=1 \
 		--label arroyo.nexmark.run_id="$run_id" \
 		-p "${arroyo_host_port}:5115" \
-		-e ARROYO__PROCESS_SCHEDULER__SLOTS_PER_PROCESS=1 \
+		-e ARROYO__PROCESS_SCHEDULER__SLOTS_PER_PROCESS=4 \
 		"$arroyo_image" >/dev/null
 	wait_for_port 127.0.0.1 "$arroyo_host_port" arroyo
 	local deadline=$((SECONDS + 120))

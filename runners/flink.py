@@ -221,6 +221,58 @@ QUERY_SPECS: dict[str, QuerySpec] = {
         """,
         expected_rows=lambda stats: stats["total_rows"],
     ),
+    "q16": QuerySpec(
+        name="q16",
+        sink_columns="""
+            channel STRING,
+            total_bids BIGINT,
+            min_price BIGINT,
+            max_price BIGINT,
+            avg_price DOUBLE,
+            distinct_bidders BIGINT,
+            distinct_auctions BIGINT
+        """,
+        insert_sql="""
+            INSERT INTO {sink}
+            SELECT
+                channel,
+                count(*) AS total_bids,
+                min(price) AS min_price,
+                max(price) AS max_price,
+                CAST(avg(price) AS DOUBLE) AS avg_price,
+                count(distinct bidder) AS distinct_bidders,
+                count(distinct auction) AS distinct_auctions
+            FROM {source}
+            GROUP BY channel
+        """,
+        expected_rows=lambda stats: stats["q16_expected_rows"],
+    ),
+    "q17": QuerySpec(
+        name="q17",
+        sink_columns="""
+            auction BIGINT,
+            bid_count BIGINT,
+            min_price BIGINT,
+            max_price BIGINT,
+            avg_price DOUBLE,
+            sum_price BIGINT,
+            distinct_bidders BIGINT
+        """,
+        insert_sql="""
+            INSERT INTO {sink}
+            SELECT
+                auction,
+                count(*) AS bid_count,
+                min(price) AS min_price,
+                max(price) AS max_price,
+                CAST(avg(price) AS DOUBLE) AS avg_price,
+                sum(price) AS sum_price,
+                count(distinct bidder) AS distinct_bidders
+            FROM {source}
+            GROUP BY auction
+        """,
+        expected_rows=lambda stats: stats["q17_expected_rows"],
+    ),
 }
 
 

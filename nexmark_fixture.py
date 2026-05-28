@@ -350,13 +350,18 @@ def _extract_bid_fixture(
     bid_dataset_path: Path,
     bid_rows: int,
 ) -> dict[str, int]:
-    # Keep only bid events and derive per-query expected row counts used by the benchmark runners.
-    stats = {
+    from collections import defaultdict
+
+    stats: dict[str, int] = {
         "total_rows": 0,
         "q2_expected_rows": 0,
         "q14_expected_rows": 0,
         "q21_expected_rows": 0,
+        "q16_expected_rows": 0,
+        "q17_expected_rows": 0,
     }
+    auction_set: set[int] = set()
+    channels_by_date: dict[str, set[str]] = defaultdict(set)
     with (
         combined_events_path.open("r", encoding="utf-8") as src,
         bid_dataset_path.open("w", encoding="utf-8") as dst,
@@ -393,12 +398,20 @@ def _extract_bid_fixture(
                 "baidu",
             } or "channel_id=" in str(flattened["url"]):
                 stats["q21_expected_rows"] += 1
+            auction_set.add(int(flattened["auction"]))
+            ts = str(flattened["ts"])
+            date = ts[:10]
+            channels_by_date[date].add(str(flattened["channel"]))
             if stats["total_rows"] >= bid_rows:
                 break
     if stats["total_rows"] < bid_rows:
         raise RuntimeError(
             f"official Nexmark generator produced only {stats['total_rows']} bid rows, need {bid_rows}"
         )
+    stats["q17_expected_rows"] = len(auction_set)
+    stats["q16_expected_rows"] = sum(
+        len(channels) for channels in channels_by_date.values()
+    )
     return stats
 
 
@@ -606,12 +619,18 @@ def write_keyed_bid_dataset(
 
 
 def scan_bid_dataset(dataset_path: Path) -> dict[str, int]:
-    stats = {
+    from collections import defaultdict
+
+    stats: dict[str, int] = {
         "total_rows": 0,
         "q2_expected_rows": 0,
         "q14_expected_rows": 0,
         "q21_expected_rows": 0,
+        "q16_expected_rows": 0,
+        "q17_expected_rows": 0,
     }
+    auction_set: set[int] = set()
+    channels_by_date: dict[str, set[str]] = defaultdict(set)
     with dataset_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -633,6 +652,14 @@ def scan_bid_dataset(dataset_path: Path) -> dict[str, int]:
                 "baidu",
             } or "channel_id=" in str(record["url"]):
                 stats["q21_expected_rows"] += 1
+            auction_set.add(int(record["auction"]))
+            ts = str(record["ts"])
+            date = ts[:10]
+            channels_by_date[date].add(str(record["channel"]))
+    stats["q17_expected_rows"] = len(auction_set)
+    stats["q16_expected_rows"] = sum(
+        len(channels) for channels in channels_by_date.values()
+    )
     return stats
 
 
@@ -661,6 +688,8 @@ def load_bid_dataset_stats(dataset_path: Path) -> dict[str, int]:
         "q2_expected_rows",
         "q14_expected_rows",
         "q21_expected_rows",
+        "q16_expected_rows",
+        "q17_expected_rows",
     }
     missing = sorted(required_keys - payload.keys())
     if missing:
