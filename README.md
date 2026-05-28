@@ -1,6 +1,6 @@
 # Nexmark Bench
 
-这个目录包含 Datalayers、RisingWave、Flink 的本地 Nexmark benchmark harness。
+这个目录包含 Datalayers、RisingWave、Flink、Arroyo 的本地 Nexmark benchmark harness。
 
 ## 当前设计
 
@@ -44,6 +44,7 @@ bash ./datagen.sh
 - [bench_datalayers.sh](/home/nsc/nexmark-bench/bench_datalayers.sh:1)
 - [bench_risingwave.sh](/home/nsc/nexmark-bench/bench_risingwave.sh:1)
 - [bench_flink.sh](/home/nsc/nexmark-bench/bench_flink.sh:1)
+- [bench_arroyo.sh](/home/nsc/nexmark-bench/bench_arroyo.sh:1)
 
 核心实现：
 
@@ -51,6 +52,7 @@ bash ./datagen.sh
 - [datalayers_bench_runner.py](/home/nsc/nexmark-bench/datalayers_bench_runner.py:1)
 - [risingwave_bench_runner.py](/home/nsc/nexmark-bench/risingwave_bench_runner.py:1)
 - [flink_bench_runner.py](/home/nsc/nexmark-bench/flink_bench_runner.py:1)
+- [arroyo_bench_runner.py](/home/nsc/nexmark-bench/arroyo_bench_runner.py:1)
 
 ## 推荐用法
 
@@ -98,6 +100,14 @@ bash ./bench_flink.sh \
   --queries q0,q1,q2,q14,q21,q22
 ```
 
+跑 Arroyo：
+
+```bash
+bash ./bench_arroyo.sh \
+  --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
+  --queries q0,q1,q2,q14,q21,q22
+```
+
 ## 脚本参数
 
 ### `bench_datalayers.sh`
@@ -115,7 +125,7 @@ bash ./bench_flink.sh \
 - `--queries LIST`
   逗号分隔 query 列表。
 - `--sink table|blackhole`
-  `table` 通过 sink table 的 `COUNT(*)` 判定完成；
+  `table` 通过 sink table 的 `COUNT(*) >= expected_rows` 且 Kafka consumer group lag 归零共同判定完成；
   `blackhole` 通过 Kafka consumer group lag 判定完成。
 - `--bench-root DIR`
   本次 benchmark 的临时根目录。
@@ -133,8 +143,8 @@ bash ./bench_flink.sh \
 - `--parallelism N`
   RisingWave `single_node` 的并行度。
 - `--sink table|blackhole`
-  `table` 创建 materialized view，并通过 `COUNT(*)` 判定完成。
-  `blackhole` 创建 blackhole sink，并通过 `rw_catalog.rw_kafka_job_lag` 判定完成。
+  `table` 创建 materialized view，并通过 `COUNT(*) >= expected_rows` 且 Kafka source group 进入稳定 drain 状态共同判定完成。
+  `blackhole` 创建 blackhole sink，并通过 Kafka source group 进入稳定 drain 状态判定完成。
 - `--bench-root DIR`
   本次 benchmark 的临时根目录。
 - `--no-cleanup`
@@ -157,9 +167,28 @@ bash ./bench_flink.sh \
 
 Flink runner 固定使用 blackhole sink。完成判定是 Kafka consumer group lag 到 0 后主动 cancel job。
 
+### `bench_arroyo.sh`
+
+脚本会启动本地 Kafka 容器和一个单容器 Arroyo 实例，然后通过 Arroyo REST API 提交 pipeline。
+
+主要参数：
+
+- `--dataset PATH`
+  keyed JSONL dataset 路径。默认指向仓库根目录下的稳定 dataset。runner 会自动读取与其同名关联的 stats JSON。
+- `--queries LIST`
+  逗号分隔 query 列表。
+- `--bench-root DIR`
+  本次 benchmark 的临时根目录。
+- `--no-cleanup`
+  保留 Kafka、Arroyo 容器、network 和 benchmark 创建的 pipeline；未传时会自动 cleanup。
+- `--image IMAGE`
+  覆盖默认 Arroyo 镜像。当前默认值是 `ghcr.io/arroyosystems/arroyo:0.14.1`。
+
+Arroyo runner 当前固定使用 blackhole sink。完成判定基于每个 query 显式指定的 Kafka source consumer group；由于 Arroyo 对 Kafka group 提交的是“最后已处理 offset”，完成时在 `kafka-consumer-groups` 里可能表现为每个非空分区残留 `lag=1`，runner 已按这个语义做了兜底判定。
+
 ## 指标口径
 
-三个 runner 都会统计这些核心指标：
+四个 runner 都会统计这些核心指标：
 
 - `input_rows`
   dataset 中的总输入行数。
@@ -177,10 +206,14 @@ Flink runner 固定使用 blackhole sink。完成判定是 Kafka consumer group 
   replay 窗口内的平均 CPU。
 - `avg_mem_gib`
   replay 窗口内的平均 RSS，单位 GiB。
+
+当前 Datalayers runner 会尝试根据 `bench_datalayers.sh` 连接的 HTTP 端口自动探测本机监听 PID，并对该 PID 做采样；如果探测失败，这两个字段会回退为 `0`。
 - `kafka_preload_sec`
   本轮 query 输入 preload 到 Kafka 的耗时，不计入 `throughput_rps` 分母。
 
 Flink 的结果没有 `inserted_rows`，因为当前完成判定是 source 消费完所有输入后主动 cancel job，结果里保留的是 `expected_rows` 和 `state`。
+
+Arroyo 的结果目前也没有 `inserted_rows`，因为当前只支持 blackhole sink；结果里保留的是 `expected_rows` 和 pipeline 在完成判定时观察到的 `state`。
 
 dataset stats 里的这些字段是提前从 dataset 扫描得到的：
 
@@ -211,6 +244,12 @@ Flink：
 - `<bench_root>/flink/report.md`
 - `<bench_root>/flink/report.json`
 - `<bench_root>/flink/<query>_samples.csv`
+
+Arroyo：
+
+- `<bench_root>/arroyo/report.md`
+- `<bench_root>/arroyo/report.json`
+- `<bench_root>/arroyo/<query>_samples.csv`
 
 三个 `report.json` 现在都使用同一组顶层字段：
 

@@ -30,9 +30,9 @@
 - `throughput_rps`
   定义为 `input_rows / replay_sec`，分母只包含 replay 窗口，不包含 dataset 生成或 Kafka preload。
 - `avg_cpu_percent`
-  当前固定为 `0.0`，因为远端 HTTP 连接模式下不负责采样 Datalayers 进程。
+  replay 窗口内，对监听 HTTP 端口的本机 Datalayers 进程做周期性 `ps` 采样后取平均值；探测不到 PID 时为 `0.0`。
 - `avg_mem_gib`
-  当前固定为 `0.0`，因为远端 HTTP 连接模式下不负责采样 Datalayers 进程。
+  replay 窗口内，对监听 HTTP 端口的本机 Datalayers 进程 RSS 做周期性 `ps` 采样后取平均值，并换算为 GiB；探测不到 PID 时为 `0.0`。
 - `kafka_preload_sec`
   把本轮 query 输入数据写入 Kafka topic 的耗时，单独记录，不计入 throughput 分母。
 
@@ -45,10 +45,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -286,6 +288,73 @@ class DatalayersHttpSql:
         raise BenchError(f"cannot parse scalar result from http output: {payload}")
 
 
+class ProcessMonitor:
+    def __init__(self, pid: int, output_csv: Path, sample_interval: float):
+        self.pid = pid
+        self.output_csv = output_csv
+        self.sample_interval = sample_interval
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.output_csv.parent.mkdir(parents=True, exist_ok=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        with self.output_csv.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["ts_epoch", "cpu_percent", "rss_kib"])
+            while not self._stop.is_set():
+                sample = read_process_sample(self.pid)
+                if sample is not None:
+                    writer.writerow(sample)
+                    fh.flush()
+                time.sleep(self.sample_interval)
+
+
+def read_process_sample(pid: int) -> tuple[float, float, int] | None:
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "%cpu=", "-o", "rss="],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        return None
+    fields = result.stdout.strip().split()
+    if len(fields) < 2:
+        return None
+    try:
+        cpu_percent = float(fields[0])
+        rss_kib = int(fields[1])
+    except ValueError:
+        return None
+    return time.time(), cpu_percent, rss_kib
+
+
+def summarize_samples(path: Path) -> tuple[float, float]:
+    cpu_values: list[float] = []
+    rss_values: list[int] = []
+    if not path.exists():
+        return 0.0, 0.0
+    with path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            cpu_values.append(float(row["cpu_percent"]))
+            rss_values.append(int(row["rss_kib"]))
+    if not cpu_values or not rss_values:
+        return 0.0, 0.0
+    avg_cpu = sum(cpu_values) / len(cpu_values)
+    avg_mem_gib = (sum(rss_values) / len(rss_values)) / 1024 / 1024
+    return avg_cpu, avg_mem_gib
+
+
 def run_cmd(cmd: list[str], input_path: Path | None = None, timeout: int = 300) -> None:
     stdin = None
     try:
@@ -375,19 +444,31 @@ def load_topic(container: str, topic: str, dataset_path: Path) -> float:
 
 
 def wait_for_count(
-    sql: DatalayersHttpSql, database: str, table: str, expected_rows: int, timeout: int
+    sql: DatalayersHttpSql,
+    database: str,
+    table: str,
+    expected_rows: int,
+    container: str,
+    group: str,
+    topic: str,
+    timeout: int,
 ) -> tuple[int, float]:
-    # Table sink completion is defined as "the sink table has observed at least the expected
-    # number of output rows for the current query semantics".
-    log(f"Waiting for sink table {database}.{table} to reach {expected_rows} rows")
+    # Table sink completion requires both the expected result cardinality and the upstream source
+    # to fully drain, otherwise selective queries can finish too early.
+    log(
+        f"Waiting for sink table {database}.{table} to reach {expected_rows} rows "
+        f"and Kafka group `{group}` lag to reach 0"
+    )
     start = time.time()
     while True:
         count = sql.scalar_i64(f"SELECT COUNT(*) AS c FROM {table}", database)
-        if count >= expected_rows:
+        lag = kafka_group_lag(container, group, topic)
+        if count >= expected_rows and lag == 0:
             return count, time.time() - start
         if time.time() - start > timeout:
             raise BenchError(
-                f"timeout waiting for {table} to reach {expected_rows} rows, current={count}"
+                f"timeout waiting for {table} count>={expected_rows} and kafka lag=0, "
+                f"current_count={count} current_lag={lag}"
             )
         time.sleep(1)
 
@@ -475,8 +556,9 @@ def create_table_sink(
             {query.sink_columns}
         )
         ENGINE=TimeSeries
+        WITH (memtable_size=1024MB)
         PARTITION BY HASH(auction)
-        PARTITIONS 1
+        PARTITIONS 4
         """,
         database=database,
     )
@@ -655,10 +737,10 @@ def markdown_report(
             "## Notes",
             "",
             "- `q0/q1/q2/q14/q21/q22` are treated as supported benchmark scenarios.",
-            "- `sink=table` writes into a Datalayers table and waits on `COUNT(*)`.",
+            "- `sink=table` writes into a Datalayers table and waits on both `COUNT(*)` and Kafka consumer lag reaching 0.",
             "- `sink=blackhole` writes into a Datalayers blackhole sink and waits on Kafka consumer lag reaching 0.",
             "- `throughput` is computed as input rows divided by replay time.",
-            "- `avg cpu` and `avg mem` are sampled from the Datalayers process during the replay window.",
+            "- `avg cpu` and `avg mem` are sampled from the detected local Datalayers PID when available; otherwise they remain 0.",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -726,6 +808,17 @@ def parse_args() -> argparse.Namespace:
         default=600,
         help="每个 query 的完成等待超时时间，单位秒。",
     )
+    parser.add_argument(
+        "--engine-pid",
+        type=int,
+        help="待采样的 Datalayers 进程 PID；未提供时 CPU 和内存统计保持为 0。",
+    )
+    parser.add_argument(
+        "--sample-interval",
+        type=float,
+        default=1.0,
+        help="CPU 和 RSS 采样间隔，单位秒。",
+    )
     return parser.parse_args()
 
 
@@ -780,26 +873,50 @@ def main() -> int:
                 sink = create_blackhole_sink(sql, database, query)
             kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
             expected_rows = query.expected_rows(dataset_stats)
+            sample_csv = workdir / f"{query.name}_samples.csv"
+            monitor = (
+                ProcessMonitor(args.engine_pid, sample_csv, args.sample_interval)
+                if args.engine_pid is not None
+                else None
+            )
             replay_t0 = time.time()
             log(f"Starting replay window for query {query.name}")
-            # The replay window intentionally includes source and pipeline creation.
-            source, pipeline = create_source_and_pipeline(
-                sql, database, topic, args.kafka_brokers, query, sink
-            )
-            if sink_mode == SinkMode.TABLE:
-                inserted_rows, _ = wait_for_count(
-                    sql, database, sink, expected_rows, args.timeout
+            if monitor is not None:
+                monitor.start()
+            try:
+                # The replay window intentionally includes source and pipeline creation.
+                source, pipeline = create_source_and_pipeline(
+                    sql, database, topic, args.kafka_brokers, query, sink
                 )
-            else:
-                current_pipeline_id = pipeline_id(sql, database, pipeline)
-                group = f"datalayers-{current_pipeline_id}-group"
-                inserted_rows, _ = wait_for_group_lag_zero(
-                    args.kafka_container, group, topic, args.timeout
-                )
-                inserted_rows = expected_rows
+                if sink_mode == SinkMode.TABLE:
+                    current_pipeline_id = pipeline_id(sql, database, pipeline)
+                    group = f"datalayers-{current_pipeline_id}-group"
+                    inserted_rows, _ = wait_for_count(
+                        sql,
+                        database,
+                        sink,
+                        expected_rows,
+                        args.kafka_container,
+                        group,
+                        topic,
+                        args.timeout,
+                    )
+                else:
+                    current_pipeline_id = pipeline_id(sql, database, pipeline)
+                    group = f"datalayers-{current_pipeline_id}-group"
+                    inserted_rows, _ = wait_for_group_lag_zero(
+                        args.kafka_container, group, topic, args.timeout
+                    )
+                    inserted_rows = expected_rows
+            finally:
+                if monitor is not None:
+                    monitor.stop()
             replay_t1 = time.time()
             replay_sec = replay_t1 - replay_t0
-            avg_cpu_percent, avg_mem_gib = 0.0, 0.0
+            if monitor is not None:
+                avg_cpu_percent, avg_mem_gib = summarize_samples(sample_csv)
+            else:
+                avg_cpu_percent, avg_mem_gib = 0.0, 0.0
             state = pipeline_state(sql, database, pipeline)
             log(
                 f"Finished benchmark for query {query.name}: inserted_rows={inserted_rows} "
@@ -821,6 +938,7 @@ def main() -> int:
                     "kafka_preload_sec": round(kafka_preload_sec, 3),
                     "sink_mode": sink_mode.value,
                     "state": state,
+                    "sample_csv": str(sample_csv),
                 }
             )
         finally:
