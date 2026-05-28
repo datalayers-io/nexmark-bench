@@ -13,7 +13,7 @@ usage() {
 
 Usage:
   risingwave.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22,q16,q17] [--parallelism N] [--sink table|blackhole]
-                      [--bench-root DIR] [--no-cleanup] [--image IMAGE]
+                      [--bench-root DIR] [--timeout SEC] [--no-cleanup] [--image IMAGE]
 
 参数:
   --dataset PATH
@@ -37,6 +37,10 @@ Usage:
 
   --bench-root DIR
       benchmark 临时根目录。
+
+  --timeout SEC
+      每个 query 的完成等待超时时间，单位秒。
+      默认: 600
 
   --no-cleanup
       保留 Kafka、RisingWave 容器、network 和 benchmark 创建的对象。
@@ -64,6 +68,7 @@ no_cleanup="0"
 bench_root=""
 rw_image="${RISINGWAVE_IMAGE:-risingwavelabs/risingwave:v2.8.3}"
 dataset="$project_root/nexmark_bid.keyed.jsonl"
+timeout_sec="600"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -85,6 +90,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--bench-root)
 		bench_root="$2"
+		shift 2
+		;;
+	--timeout)
+		timeout_sec="$2"
 		shift 2
 		;;
 	--no-cleanup)
@@ -277,6 +286,7 @@ run_bench() {
 		--queries "$queries" \
 		--parallelism "$parallelism" \
 		--sink "$sink" \
+		--timeout "$timeout_sec" \
 		--no-cleanup "$no_cleanup"
 	log "RisingWave Nexmark benchmark finished"
 }

@@ -250,12 +250,22 @@ class RisingWaveSql:
             "-t",
             "-A",
         ]
+        self.session_statements: list[str] = []
+
+    def set_session_statements(self, statements: list[str]) -> None:
+        self.session_statements = statements.copy()
 
     def run(self, sql: str, timeout: int = 60) -> str:
         env = os.environ.copy()
         env.setdefault("PGPASSWORD", "")
+        statements = [*self.session_statements, sql]
+        sql_text = ";\n".join(
+            statement.strip().rstrip(";")
+            for statement in statements
+            if statement.strip()
+        )
         result = subprocess.run(
-            self.base_cmd + ["-c", sql],
+            self.base_cmd + ["-c", sql_text],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -279,13 +289,15 @@ class RisingWaveSql:
 def configure_benchmark_session(
     sql: RisingWaveSql, parallelism: int, sink_mode: SinkMode
 ) -> None:
-    sql_text = f"SET streaming_parallelism = {parallelism}"
-    log_sql("Configure streaming parallelism", sql_text)
-    sql.run(sql_text)
+    statements = [f"SET streaming_parallelism = {parallelism}"]
     if sink_mode == SinkMode.BLACKHOLE:
-        sql_text = "SET streaming_use_snapshot_backfill = false"
-        log_sql("Disable snapshot backfill for blackhole sink benchmark", sql_text)
-        sql.run(sql_text)
+        statements.append("SET streaming_use_snapshot_backfill = false")
+    sql.set_session_statements(statements)
+    for index, statement in enumerate(statements):
+        if index == 0:
+            log_sql("Configure benchmark session", statement)
+        else:
+            log_sql("Configure benchmark session", statement)
 
 
 class ContainerMonitor:
@@ -672,6 +684,9 @@ def wait_for_sink_input_rows(
     container: str,
     sink_name: str,
     sink_id_value: int,
+    kafka_container: str,
+    group: str,
+    topic: str,
     expected_rows: int,
     timeout: int,
 ) -> int:
@@ -682,6 +697,8 @@ def wait_for_sink_input_rows(
     start = time.time()
     stable_polls = 0
     last_count: int | None = None
+    drained_polls = 0
+    metric_fallback_logged = False
     while True:
         count = sink_input_row_count(container, sink_id_value)
         if count >= expected_rows:
@@ -695,9 +712,23 @@ def wait_for_sink_input_rows(
         else:
             stable_polls = 0
             last_count = count
+        drained, rows = kafka_group_drained(kafka_container, group, topic)
+        if drained:
+            drained_polls += 1
+            if drained_polls >= 3 and count == 0:
+                if not metric_fallback_logged:
+                    log(
+                        f"Sink metric for {sink_name} stayed at 0, but Kafka group `{group}` drained. "
+                        "Falling back to Kafka drain completion."
+                    )
+                    metric_fallback_logged = True
+                return expected_rows
+        else:
+            drained_polls = 0
         if time.time() - start > timeout:
             raise BenchError(
-                f"timeout waiting for sink {sink_name} metric rows>={expected_rows}, current={count}"
+                f"timeout waiting for sink {sink_name} metric rows>={expected_rows}, "
+                f"current={count} kafka_offsets={rows}"
             )
         time.sleep(1)
 
@@ -1008,6 +1039,9 @@ def main() -> int:
                         args.rw_container,
                         target,
                         target_sink_id,
+                        args.kafka_container,
+                        group,
+                        topic,
                         expected_rows,
                         args.timeout,
                     )

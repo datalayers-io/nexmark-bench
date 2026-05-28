@@ -12,7 +12,7 @@ usage() {
 运行本地 Flink Nexmark benchmark。
 
 Usage:
-  flink.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22,q16,q17] [--bench-root DIR] [--parallelism N] [--no-cleanup]
+  flink.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22,q16,q17] [--bench-root DIR] [--parallelism N] [--timeout SEC] [--no-cleanup]
 
 参数:
   --dataset PATH
@@ -30,6 +30,10 @@ Usage:
   --parallelism N
       Flink 任务并行度。
       默认: 1
+
+  --timeout SEC
+      每个 query 的完成等待超时时间，单位秒。
+      默认: 600
 
   --no-cleanup
       保留 Kafka 容器。
@@ -52,6 +56,7 @@ parallelism="1"
 no_cleanup="0"
 bench_root=""
 dataset="$project_root/nexmark_bid.keyed.jsonl"
+timeout_sec="600"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -69,6 +74,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--parallelism)
 		parallelism="$2"
+		shift 2
+		;;
+	--timeout)
+		timeout_sec="$2"
 		shift 2
 		;;
 	--no-cleanup)
@@ -195,6 +204,7 @@ run_bench() {
 		--dataset "$dataset" \
 		--queries "$queries" \
 		--parallelism "$parallelism" \
+		--timeout "$timeout_sec" \
 		--no-cleanup "$no_cleanup"
 	log "Flink Nexmark benchmark finished"
 }

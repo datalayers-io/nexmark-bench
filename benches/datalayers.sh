@@ -14,7 +14,7 @@ usage() {
 Usage:
   datalayers.sh [--host HOST] [--port HTTP_PORT] [--dataset PATH]
                       [--queries q0,q1,q2,q14,q21,q22,q16,q17] [--sink table|blackhole]
-                      [--bench-root DIR] [--no-cleanup]
+                      [--bench-root DIR] [--timeout SEC] [--no-cleanup]
 
 参数:
   -h, --host HOST
@@ -43,6 +43,10 @@ Usage:
   --bench-root DIR
       benchmark 临时根目录。
 
+  --timeout SEC
+      每个 query 的完成等待超时时间，单位秒。
+      默认: 600
+
   --no-cleanup
       保留 Kafka 容器以及 benchmark 创建的 database/source/pipeline/sink/table 等对象。
       未传时会在 bench 结束后执行 cleanup。
@@ -66,6 +70,7 @@ bench_root=""
 dataset="$project_root/nexmark_bid.keyed.jsonl"
 external_host="127.0.0.1"
 external_port="8361"
+timeout_sec="600"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -91,6 +96,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--bench-root)
 		bench_root="$2"
+		shift 2
+		;;
+	--timeout)
+		timeout_sec="$2"
 		shift 2
 		;;
 	--no-cleanup)
@@ -237,6 +246,7 @@ run_bench() {
 		--dataset "$dataset"
 		--queries "$queries"
 		--sink "$sink"
+		--timeout "$timeout_sec"
 		--no-cleanup "$no_cleanup"
 	)
 	if [[ -n "$engine_pid" ]]; then

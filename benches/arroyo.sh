@@ -13,7 +13,7 @@ usage() {
 
 Usage:
   arroyo.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22,q16,q17]
-                  [--parallelism N] [--bench-root DIR] [--no-cleanup] [--image IMAGE]
+                  [--parallelism N] [--bench-root DIR] [--timeout SEC] [--no-cleanup] [--image IMAGE]
                   [--sink table|blackhole]
 
 参数:
@@ -32,6 +32,10 @@ Usage:
   --parallelism N
       Arroyo pipeline 并行度。
       默认: 1
+
+  --timeout SEC
+      每个 query 的完成等待超时时间，单位秒。
+      默认: 600
 
   --no-cleanup
       保留 Kafka、Arroyo 容器、network 和 benchmark 创建的 pipeline。
@@ -64,6 +68,7 @@ arroyo_image="${ARROYO_IMAGE:-ghcr.io/arroyosystems/arroyo:0.14.1}"
 dataset="$project_root/nexmark_bid.keyed.jsonl"
 parallelism="1"
 sink="blackhole"
+timeout_sec="600"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -81,6 +86,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--parallelism)
 		parallelism="$2"
+		shift 2
+		;;
+	--timeout)
+		timeout_sec="$2"
 		shift 2
 		;;
 	--no-cleanup)
@@ -250,6 +259,7 @@ run_bench() {
 		--dataset "$dataset" \
 		--queries "$queries" \
 		--parallelism "$parallelism" \
+		--timeout "$timeout_sec" \
 		--arroyo-container "$arroyo_container" \
 		--no-cleanup "$no_cleanup" \
 		--sink "$sink"
