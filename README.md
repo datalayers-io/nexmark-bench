@@ -10,7 +10,7 @@
 - 抽取出的 bid 会被扁平化，并写入稳定命名的 keyed JSONL 文件，默认是 [nexmark_bid.keyed.jsonl](/home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl)。
 - datagen 会同时写出与 dataset 同名关联的 stats JSON；默认 stats 文件是 [nexmark_bid.keyed.stats.json](/home/nsc/nexmark-bench/nexmark_bid.keyed.stats.json)。
 - benchmark 脚本不再在运行时临时生成 fixture。它们只接收 `--dataset`，默认指向仓库根目录下的稳定 dataset 文件。
-- 当前默认 query 是 `q0,q1,q2,q14,q21,q22`。
+- 当前默认 query 是 `q0,q1,q2,q14,q21,q22,q16,q17`。
 - 当前 throughput 统一定义为 `input_rows / replay_sec`。
 
 ## 数据生成
@@ -67,7 +67,7 @@ bash ./datagen.sh
 ```bash
 bash ./benches/datalayers.sh \
   --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
-  --queries q0,q1,q2,q14,q21,q22 \
+  --queries q0,q1,q2,q14,q21,q22,q16,q17 \
   --sink table \
   --host 127.0.0.1 \
   --port 8361
@@ -78,7 +78,7 @@ bash ./benches/datalayers.sh \
 ```bash
 bash ./benches/datalayers.sh \
   --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
-  --queries q0,q1,q2,q14,q21,q22 \
+  --queries q0,q1,q2,q14,q21,q22,q16,q17 \
   --sink table
 ```
 
@@ -87,7 +87,7 @@ bash ./benches/datalayers.sh \
 ```bash
 bash ./benches/risingwave.sh \
   --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
-  --queries q0,q1,q2,q14,q21,q22 \
+  --queries q0,q1,q2,q14,q21,q22,q16,q17 \
   --parallelism 1 \
   --sink table
 ```
@@ -97,7 +97,7 @@ bash ./benches/risingwave.sh \
 ```bash
 bash ./benches/flink.sh \
   --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
-  --queries q0,q1,q2,q14,q21,q22
+  --queries q0,q1,q2,q14,q21,q22,q16,q17
 ```
 
 跑 Arroyo：
@@ -105,7 +105,7 @@ bash ./benches/flink.sh \
 ```bash
 bash ./benches/arroyo.sh \
   --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
-  --queries q0,q1,q2,q14,q21,q22
+  --queries q0,q1,q2,q14,q21,q22,q16,q17
 ```
 
 ## 脚本参数
@@ -161,7 +161,7 @@ bash ./benches/arroyo.sh \
 - `--queries LIST`
   逗号分隔 query 列表。
 - `--parallelism N`
-  Arroyo pipeline 并行度。
+  Flink 任务并行度。
 - `--bench-root DIR`
   本次 benchmark 的临时根目录。
 - `--no-cleanup`
@@ -225,8 +225,10 @@ dataset stats 里的这些字段是提前从 dataset 扫描得到的：
 - `q2_expected_rows`
 - `q14_expected_rows`
 - `q21_expected_rows`
+- `q16_expected_rows`
+- `q17_expected_rows`
 
-三个 runner 会直接读取与 `--dataset` 同名关联的 stats JSON，而不是在 benchmark 启动时重新全量扫描 dataset。当前命名规则是把 dataset 文件名末尾的 `.jsonl` 替换成 `.stats.json`；例如 `foo.keyed.jsonl` 对应 `foo.keyed.stats.json`。
+四个 runner 会直接读取与 `--dataset` 同名关联的 stats JSON，而不是在 benchmark 启动时重新全量扫描 dataset。当前命名规则是把 dataset 文件名末尾的 `.jsonl` 替换成 `.stats.json`；例如 `foo.keyed.jsonl` 对应 `foo.keyed.stats.json`。
 
 ## 结果文件
 

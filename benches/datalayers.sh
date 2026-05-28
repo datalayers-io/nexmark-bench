@@ -13,7 +13,7 @@ usage() {
 
 Usage:
   datalayers.sh [--host HOST] [--port HTTP_PORT] [--dataset PATH]
-                      [--queries q0,q1,q2,q14,q21,q22] [--sink table|blackhole]
+                      [--queries q0,q1,q2,q14,q21,q22,q16,q17] [--sink table|blackhole]
                       [--bench-root DIR] [--no-cleanup]
 
 参数:
@@ -31,8 +31,9 @@ Usage:
       默认: ./nexmark_bid.keyed.jsonl
 
   --queries LIST
-      逗号分隔的 query 列表。支持: q0,q1,q2,q14,q21,q22。
-      默认: q0,q1,q2,q14,q21,q22
+      逗号分隔的 query 列表。支持: q0,q1,q2,q14,q21,q22,q16,q17。
+      Datalayers 暂不支持 q16,q17，runner 会自动跳过。
+      默认: q0,q1,q2,q14,q21,q22,q16,q17
 
   --sink MODE
       `table` 创建表 sink，并通过行数判定完成。
@@ -58,7 +59,7 @@ log() {
 	printf '[%s UTC] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$1"
 }
 
-queries="q0,q1,q2,q14,q21,q22"
+queries="q0,q1,q2,q14,q21,q22,q16,q17"
 sink="table"
 no_cleanup="0"
 bench_root=""

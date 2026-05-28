@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-这个文件负责把官方 Nexmark 数据生成链路适配成当前仓库里三个 benchmark runner
+这个文件负责把官方 Nexmark 数据生成链路适配成当前仓库里四个 benchmark runner
 可以直接复用的输入 fixture。
 
 它本身不是一个完整 benchmark runner，不负责执行 query，也不负责统计吞吐量。
-它只负责“准备输入数据”，供 Datalayers、RisingWave、Flink 三个 runner 共享。
+它只负责“准备输入数据”，供 Datalayers、RisingWave、Flink、Arroyo 四个 runner 共享。
 
 整体流程：
 
@@ -16,6 +16,8 @@
    - `q2_expected_rows`
    - `q14_expected_rows`
    - `q21_expected_rows`
+   - `q16_expected_rows`
+   - `q17_expected_rows`
 6. 把结果返回给各个 runner，由 runner 再将其 preload 到每个 query 的专用 topic。
 
 这个文件输出的核心结果是：

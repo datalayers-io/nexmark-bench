@@ -12,7 +12,7 @@ usage() {
 运行本地 RisingWave Nexmark benchmark。
 
 Usage:
-  risingwave.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22] [--parallelism N] [--sink table|blackhole]
+  risingwave.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22,q16,q17] [--parallelism N] [--sink table|blackhole]
                       [--bench-root DIR] [--no-cleanup] [--image IMAGE]
 
 参数:
@@ -22,8 +22,8 @@ Usage:
       默认: ./nexmark_bid.keyed.jsonl
 
   --queries LIST
-      逗号分隔的 query 列表。支持: q0,q1,q2,q14,q21,q22。
-      默认: q0,q1,q2,q14,q21,q22
+      逗号分隔的 query 列表。支持: q0,q1,q2,q14,q21,q22,q16,q17。
+      默认: q0,q1,q2,q14,q21,q22,q16,q17
 
   --parallelism N
       RisingWave `single_node` 的并行度。
@@ -57,7 +57,7 @@ log() {
 	printf '[%s UTC] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$1"
 }
 
-queries="q0,q1,q2,q14,q21,q22"
+queries="q0,q1,q2,q14,q21,q22,q16,q17"
 parallelism="1"
 sink="table"
 no_cleanup="0"

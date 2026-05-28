@@ -12,7 +12,7 @@ usage() {
 运行本地 Arroyo Nexmark benchmark。
 
 Usage:
-  arroyo.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22]
+  arroyo.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22,q16,q17]
                   [--parallelism N] [--bench-root DIR] [--no-cleanup] [--image IMAGE]
                   [--sink table|blackhole]
 
@@ -23,8 +23,8 @@ Usage:
       默认: ./nexmark_bid.keyed.jsonl
 
   --queries LIST
-      逗号分隔的 query 列表。支持: q0,q1,q2,q14,q21,q22。
-      默认: q0,q1,q2,q14,q21,q22
+      逗号分隔的 query 列表。支持: q0,q1,q2,q14,q21,q22,q16,q17。
+      默认: q0,q1,q2,q14,q21,q22,q16,q17
 
   --bench-root DIR
       benchmark 临时根目录。
@@ -57,7 +57,7 @@ log() {
 	printf '[%s UTC] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$1"
 }
 
-queries="q0,q1,q2,q14,q21,q22"
+queries="q0,q1,q2,q14,q21,q22,q16,q17"
 no_cleanup="0"
 bench_root=""
 arroyo_image="${ARROYO_IMAGE:-ghcr.io/arroyosystems/arroyo:0.14.1}"

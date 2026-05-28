@@ -803,7 +803,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--queries",
-        default="q0,q1,q2,q14,q21,q22",
+        default="q0,q1,q2,q14,q21,q22,q16,q17",
         help="逗号分隔的 query 列表。",
     )
     parser.add_argument(
