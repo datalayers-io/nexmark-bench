@@ -1,20 +1,30 @@
 #!/usr/bin/env bash
 
-# 这个脚本是 Flink Nexmark benchmark 的本地入口。
-# 它负责准备临时目录、启动 Kafka，并把 Kafka 地址、dataset 和工作目录参数传给
-# `flink_bench_runner.py`。Flink toolchain 准备、query 执行、指标统计和 report
-# 生成都在 Python runner 里完成。
+# 这个脚本是 Datalayers Nexmark benchmark 的本地入口。
+# 它负责准备临时目录、启动 Kafka，并通过 HTTP SQL 连接一个已经启动好的 Datalayers
+# 实例。真正的 query 执行、指标统计和 report 生成都在 `runners/datalayers.py`
+# 里完成。
 
 set -euo pipefail
 
 usage() {
 	cat <<'EOF'
-运行本地 Flink Nexmark benchmark。
+运行本地 Datalayers Nexmark benchmark。
 
 Usage:
-  bench_flink.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22] [--bench-root DIR] [--no-cleanup]
+  datalayers.sh [--host HOST] [--port HTTP_PORT] [--dataset PATH]
+                      [--queries q0,q1,q2,q14,q21,q22] [--sink table|blackhole]
+                      [--bench-root DIR] [--no-cleanup]
 
 参数:
+  -h, --host HOST
+      已启动 Datalayers HTTP SQL endpoint 的 host 地址。
+      默认: 127.0.0.1
+
+  -P, --port HTTP_PORT
+      已启动 Datalayers HTTP SQL endpoint 的端口。
+      默认: 8361
+
   --dataset PATH
       用于 Kafka preload 的 keyed JSONL dataset 路径。
       关联的 stats 文件会按同名规则自动推导并由 runner 读取。
@@ -24,11 +34,16 @@ Usage:
       逗号分隔的 query 列表。支持: q0,q1,q2,q14,q21,q22。
       默认: q0,q1,q2,q14,q21,q22
 
+  --sink MODE
+      `table` 创建表 sink，并通过行数判定完成。
+      `blackhole` 创建 blackhole sink，并通过 kafka consumer lag 判定完成。
+      默认: table
+
   --bench-root DIR
       benchmark 临时根目录。
 
   --no-cleanup
-      保留 Kafka 容器。
+      保留 Kafka 容器以及 benchmark 创建的 database/source/pipeline/sink/table 等对象。
       未传时会在 bench 结束后执行 cleanup。
 
   --help
@@ -36,7 +51,7 @@ Usage:
 EOF
 }
 
-project_root="$(cd "$(dirname "$0")" && pwd)"
+project_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$project_root"
 
 log() {
@@ -44,18 +59,33 @@ log() {
 }
 
 queries="q0,q1,q2,q14,q21,q22"
+sink="table"
 no_cleanup="0"
 bench_root=""
 dataset="$project_root/nexmark_bid.keyed.jsonl"
+external_host="127.0.0.1"
+external_port="8361"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-	--queries)
-		queries="$2"
+	-h | --host)
+		external_host="$2"
+		shift 2
+		;;
+	-P | --port)
+		external_port="$2"
 		shift 2
 		;;
 	--dataset)
 		dataset="$2"
+		shift 2
+		;;
+	--queries)
+		queries="$2"
+		shift 2
+		;;
+	--sink)
+		sink="$2"
 		shift 2
 		;;
 	--bench-root)
@@ -66,7 +96,7 @@ while [[ $# -gt 0 ]]; do
 		no_cleanup="1"
 		shift
 		;;
-	-h | --help)
+	--help)
 		usage
 		exit 0
 		;;
@@ -89,10 +119,11 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 if [[ -z "$bench_root" ]]; then
 	bench_root="$(mktemp -d "${TMPDIR:-/tmp}/nexmark-bench.XXXXXX")"
 fi
-work_dir="$bench_root/flink"
+work_dir="$bench_root/datalayers"
 run_id="$(basename "$bench_root" | tr -c '[:alnum:]' '-')"
-kafka_container="flink-nexmark-kafka-${run_id}"
+kafka_container="datalayers-nexmark-kafka-${run_id}"
 kafka_host_port=""
+engine_pid=""
 
 cleanup_services() {
 	if [[ "$no_cleanup" == "1" ]]; then
@@ -130,15 +161,32 @@ find_free_port() {
 }
 
 prepare_workspace() {
-	# Keep per-run outputs isolated because Flink leaves logs and local state in the workdir.
-	log "Preparing Flink benchmark workspace at $work_dir"
+	log "Preparing Datalayers benchmark workspace at $work_dir"
 	cleanup_services
 	rm -rf "$work_dir"
 	mkdir -p "$work_dir"
 }
 
+detect_engine_pid() {
+	local pid=""
+	if command -v lsof >/dev/null 2>&1; then
+		pid="$(lsof -tiTCP:"$external_port" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
+	fi
+	if [[ -z "$pid" ]] && command -v fuser >/dev/null 2>&1; then
+		pid="$(fuser -n tcp "$external_port" 2>/dev/null | awk '{print $1}' || true)"
+	fi
+	if [[ -z "$pid" ]]; then
+		pid="$(ss -ltnp "( sport = :$external_port )" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1 || true)"
+	fi
+	if [[ -n "$pid" ]]; then
+		log "Detected Datalayers listener PID $pid on port $external_port"
+	else
+		log "Could not detect a listener PID on port $external_port; CPU and memory stats will stay at 0"
+	fi
+	engine_pid="$pid"
+}
+
 start_kafka() {
-	# Kafka is recreated per run so the replay harness starts from a clean topic set.
 	log "Starting Kafka container $kafka_container on host port $kafka_host_port"
 	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
 	docker run -d --name "$kafka_container" \
@@ -173,19 +221,29 @@ start_kafka() {
 }
 
 run_bench() {
-	# The Python runner starts Flink, submits jobs and aggregates metrics.
-	log "Running Flink Nexmark benchmark: dataset=$dataset queries=$queries"
-	python3 ./flink_bench_runner.py \
-		--kafka-container "$kafka_container" \
-		--kafka-port "$kafka_host_port" \
-		--workdir "$work_dir" \
-		--dataset "$dataset" \
+	log "Running Datalayers Nexmark benchmark: host=$external_host port=$external_port dataset=$dataset queries=$queries sink=$sink"
+	local cmd=(
+		python3 ./runners/datalayers.py
+		--host "$external_host"
+		--port "$external_port"
+		--kafka-brokers "127.0.0.1:${kafka_host_port}"
+		--kafka-container "$kafka_container"
+		--workdir "$work_dir"
+		--dataset "$dataset"
 		--queries "$queries"
-	log "Flink Nexmark benchmark finished"
+		--sink "$sink"
+		--no-cleanup "$no_cleanup"
+	)
+	if [[ -n "$engine_pid" ]]; then
+		cmd+=(--engine-pid "$engine_pid")
+	fi
+	"${cmd[@]}"
+	log "Datalayers Nexmark benchmark finished"
 }
 
-prepare_workspace
 kafka_host_port="$(find_free_port 9092 9192)"
+prepare_workspace
+detect_engine_pid
 start_kafka
 run_bench
 

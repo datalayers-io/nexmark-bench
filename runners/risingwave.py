@@ -7,7 +7,7 @@
 
 执行方式：
 
-1. `bench_risingwave.sh` 负责启动 Kafka、RisingWave standalone 容器，并把连接参数传入本文件。
+1. `benches/risingwave.sh` 负责启动 Kafka、RisingWave standalone 容器，并把连接参数传入本文件。
 2. 本文件读取与 dataset 关联的 stats JSON，拿到输入行数和几个 query 的理论输出行数。
 3. 对每个 query：
    - 重建独立的 Kafka topic

@@ -2,7 +2,7 @@
 """
 这个 bench runner 用来在本地单节点 Arroyo 上运行一组固定的 Nexmark 风格查询。
 
-它消费的是一个已经预先准备好的 keyed bid JSONL dataset。`bench_arroyo.sh` 负责启动
+它消费的是一个已经预先准备好的 keyed bid JSONL dataset。`benches/arroyo.sh` 负责启动
 Kafka 和 Arroyo 单容器，并把 API、Kafka 和工作目录参数传入本文件。
 
 执行方式：
@@ -522,7 +522,23 @@ def render_sql(
     sink_name: str,
     kafka_brokers: str,
     group_id: str,
+    sink_mode: str,
 ) -> str:
+    if sink_mode == "blackhole":
+        sink_ddl = f"""
+CREATE TABLE {sink_name} (
+  {query.sink_columns}
+) WITH (
+  'connector' = 'blackhole'
+);
+""".strip()
+    else:
+        sink_ddl = f"""
+CREATE TABLE {sink_name} (
+  {query.sink_columns}
+);
+""".strip()
+
     return f"""
 CREATE TABLE {source_name} (
   auction BIGINT,
@@ -543,11 +559,7 @@ CREATE TABLE {source_name} (
   'source.group_id' = '{group_id}'
 );
 
-CREATE TABLE {sink_name} (
-  {query.sink_columns}
-) WITH (
-  'connector' = 'blackhole'
-);
+{sink_ddl}
 
 INSERT INTO {sink_name}
 {query.select_sql.format(source=source_name).strip()};
@@ -558,6 +570,7 @@ def markdown_report(
     args: argparse.Namespace,
     dataset_stats: dict[str, int],
     results: list[dict[str, object]],
+    sink_mode: str,
 ) -> str:
     lines = [
         "# Arroyo Nexmark Benchmark Report",
@@ -568,7 +581,7 @@ def markdown_report(
         f"- Topic partitions: `{args.partitions}`",
         f"- Pipeline parallelism: `{args.parallelism}`",
         f"- Fixture: `official keyed bid dataset`",
-        f"- Sink mode: `blackhole`",
+        f"- Sink mode: `{sink_mode}`",
         f"- Input rows: `{dataset_stats['total_rows']}`",
         f"- Dataset path: `{Path(args.dataset).resolve()}`",
         f"- Measurement mode: preload Kafka then replay from `earliest`",
@@ -591,7 +604,7 @@ def markdown_report(
             "",
             "- This benchmark runs Arroyo in a single Docker container and samples the container main process during the replay window.",
             "- Every query creates a dedicated Kafka source with an explicit `source.group_id` and waits for that Kafka consumer group lag to reach 0.",
-            "- The sink uses Arroyo's blackhole connector, so completion is defined by source consumption rather than sink materialization.",
+            "- The sink uses either Arroyo's blackhole connector or an in-memory table, so completion is defined by source consumption rather than sink materialization.",
             "- `throughput` is computed as input rows divided by replay time.",
         ]
     )
@@ -654,6 +667,12 @@ def parse_args() -> argparse.Namespace:
         help="每个 query 的完成等待超时时间，单位秒。",
     )
     parser.add_argument(
+        "--sink",
+        default="blackhole",
+        choices=["table", "blackhole"],
+        help="sink 类型：table 写入 in-memory 表，blackhole 写入 blackhole sink。",
+    )
+    parser.add_argument(
         "--sample-interval",
         type=float,
         default=1.0,
@@ -702,6 +721,8 @@ def main() -> int:
     if args.parallelism < 1:
         raise BenchError("--parallelism must be >= 1")
 
+    sink_mode = args.sink
+
     results: list[dict[str, object]] = []
     for query in queries:
         log(f"Starting benchmark for query {query.name}", color=GREEN)
@@ -709,14 +730,16 @@ def main() -> int:
         suffix = f"{int(time.time() * 1000)}"
         topic = f"nexmark_{query.name}"
         source = f"{query.name}_src_{suffix}"
-        sink = f"{query.name}_bh_{suffix}"
+        sink = f"{query.name}_{'bh' if sink_mode == 'blackhole' else 'tbl'}_{suffix}"
         group = f"nexmark-arroyo-{query.name}-{suffix}"
         pipeline_name = f"nexmark_{query.name}_{suffix}"
         ensure_topic(args.kafka_container, topic, args.partitions)
         try:
             kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
             expected_rows = query.expected_rows(dataset_stats)
-            sql = render_sql(topic, query, source, sink, args.kafka_brokers, group)
+            sql = render_sql(
+                topic, query, source, sink, args.kafka_brokers, group, sink_mode
+            )
             sample_csv = workdir / f"{query.name}_samples.csv"
             monitor = ContainerMonitor(
                 args.arroyo_container, sample_csv, args.sample_interval
@@ -793,7 +816,7 @@ def main() -> int:
                     pass
 
     report_md.write_text(
-        markdown_report(args, dataset_stats, results), encoding="utf-8"
+        markdown_report(args, dataset_stats, results, sink_mode), encoding="utf-8"
     )
     report_json.write_text(
         json.dumps(
@@ -805,7 +828,7 @@ def main() -> int:
                 "fixture_metadata": fixture_metadata,
                 "dataset_stats": dataset_stats,
                 "parallelism": args.parallelism,
-                "sink_mode": "blackhole",
+                "sink_mode": sink_mode,
                 "results": results,
             },
             indent=2,

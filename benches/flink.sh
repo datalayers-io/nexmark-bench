@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 
-# 这个脚本是 Arroyo Nexmark benchmark 的本地入口。
-# 它负责准备临时目录、启动 Kafka 和 Arroyo 单节点容器，然后把连接参数、dataset 和
-# 工作目录传给 `arroyo_bench_runner.py`。真正的 pipeline 提交、状态轮询、指标统计和
-# report 生成都在 Python runner 里完成。
+# 这个脚本是 Flink Nexmark benchmark 的本地入口。
+# 它负责准备临时目录、启动 Kafka，并把 Kafka 地址、dataset 和工作目录参数传给
+# `runners/flink.py`。Flink toolchain 准备、query 执行、指标统计和 report
+# 生成都在 Python runner 里完成。
 
 set -euo pipefail
 
 usage() {
 	cat <<'EOF'
-运行本地 Arroyo Nexmark benchmark。
+运行本地 Flink Nexmark benchmark。
 
 Usage:
-  bench_arroyo.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22]
-                  [--parallelism N] [--bench-root DIR] [--no-cleanup] [--image IMAGE]
+  flink.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22] [--bench-root DIR] [--no-cleanup]
 
 参数:
   --dataset PATH
@@ -28,23 +27,16 @@ Usage:
   --bench-root DIR
       benchmark 临时根目录。
 
-  --parallelism N
-      Arroyo pipeline 并行度。
-      默认: 1
-
   --no-cleanup
-      保留 Kafka、Arroyo 容器、network 和 benchmark 创建的 pipeline。
+      保留 Kafka 容器。
       未传时会在 bench 结束后执行 cleanup。
-
-  --image IMAGE
-      覆盖默认的 Arroyo 镜像。
 
   --help
       显示本帮助信息。
 EOF
 }
 
-project_root="$(cd "$(dirname "$0")" && pwd)"
+project_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$project_root"
 
 log() {
@@ -54,9 +46,7 @@ log() {
 queries="q0,q1,q2,q14,q21,q22"
 no_cleanup="0"
 bench_root=""
-arroyo_image="${ARROYO_IMAGE:-ghcr.io/arroyosystems/arroyo:0.14.1}"
 dataset="$project_root/nexmark_bid.keyed.jsonl"
-parallelism="1"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -72,17 +62,9 @@ while [[ $# -gt 0 ]]; do
 		bench_root="$2"
 		shift 2
 		;;
-	--parallelism)
-		parallelism="$2"
-		shift 2
-		;;
 	--no-cleanup)
 		no_cleanup="1"
 		shift
-		;;
-	--image)
-		arroyo_image="$2"
-		shift 2
 		;;
 	-h | --help)
 		usage
@@ -107,21 +89,16 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 if [[ -z "$bench_root" ]]; then
 	bench_root="$(mktemp -d "${TMPDIR:-/tmp}/nexmark-bench.XXXXXX")"
 fi
-work_dir="$bench_root/arroyo"
+work_dir="$bench_root/flink"
 run_id="$(basename "$bench_root" | tr -c '[:alnum:]' '-')"
-kafka_network="arroyo-nexmark-net-${run_id}"
-kafka_container="arroyo-nexmark-kafka-${run_id}"
-arroyo_container="arroyo-nexmark-${run_id}"
-arroyo_host_port=""
+kafka_container="flink-nexmark-kafka-${run_id}"
 kafka_host_port=""
 
 cleanup_services() {
 	if [[ "$no_cleanup" == "1" ]]; then
 		return
 	fi
-	docker rm -f "$arroyo_container" >/dev/null 2>&1 || true
 	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
-	docker network rm "$kafka_network" >/dev/null 2>&1 || true
 }
 
 trap cleanup_services EXIT
@@ -153,31 +130,27 @@ find_free_port() {
 }
 
 prepare_workspace() {
-	log "Preparing Arroyo benchmark workspace at $work_dir"
+	# Keep per-run outputs isolated because Flink leaves logs and local state in the workdir.
+	log "Preparing Flink benchmark workspace at $work_dir"
 	cleanup_services
 	rm -rf "$work_dir"
 	mkdir -p "$work_dir"
 }
 
-ensure_network() {
-	docker network inspect "$kafka_network" >/dev/null 2>&1 || docker network create "$kafka_network" >/dev/null
-}
-
 start_kafka() {
+	# Kafka is recreated per run so the replay harness starts from a clean topic set.
 	log "Starting Kafka container $kafka_container on host port $kafka_host_port"
 	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
 	docker run -d --name "$kafka_container" \
-		--network "$kafka_network" \
-		--network-alias kafka \
 		--label datalayers.nexmark.bench=1 \
 		--label datalayers.nexmark.run_id="$run_id" \
-		-p "${kafka_host_port}:29092" \
+		-p "${kafka_host_port}:9092" \
 		-e KAFKA_NODE_ID=1 \
 		-e KAFKA_PROCESS_ROLES=broker,controller \
-		-e KAFKA_LISTENERS=PLAINTEXT://:9092,PLAINTEXT_HOST://:29092,CONTROLLER://:9093 \
-		-e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://127.0.0.1:${kafka_host_port} \
-		-e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT \
-		-e KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093 \
+		-e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+		-e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:${kafka_host_port} \
+		-e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+		-e KAFKA_CONTROLLER_QUORUM_VOTERS=1@127.0.0.1:9093 \
 		-e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
 		-e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
 		-e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
@@ -199,50 +172,21 @@ start_kafka() {
 	log "Kafka container $kafka_container is ready"
 }
 
-start_arroyo() {
-	log "Starting Arroyo container $arroyo_container on host port $arroyo_host_port"
-	docker rm -f "$arroyo_container" >/dev/null 2>&1 || true
-	docker run -d --name "$arroyo_container" \
-		--network "$kafka_network" \
-		--label datalayers.nexmark.bench=1 \
-		--label datalayers.nexmark.run_id="$run_id" \
-		-p "${arroyo_host_port}:5115" \
-		"$arroyo_image" >/dev/null
-	wait_for_port 127.0.0.1 "$arroyo_host_port" arroyo
-	local deadline=$((SECONDS + 120))
-	until curl -fsS "http://127.0.0.1:${arroyo_host_port}/api/v1/ping" >/dev/null 2>&1; do
-		if ((SECONDS >= deadline)); then
-			docker logs "$arroyo_container" >&2 || true
-			echo "timeout waiting for arroyo api readiness" >&2
-			exit 1
-		fi
-		sleep 2
-	done
-	log "Arroyo container $arroyo_container is ready"
-}
-
 run_bench() {
-	log "Running Arroyo Nexmark benchmark: dataset=$dataset queries=$queries parallelism=$parallelism image=$arroyo_image"
-	python3 ./arroyo_bench_runner.py \
-		--host 127.0.0.1 \
-		--port "$arroyo_host_port" \
-		--kafka-brokers kafka:9092 \
+	# The Python runner starts Flink, submits jobs and aggregates metrics.
+	log "Running Flink Nexmark benchmark: dataset=$dataset queries=$queries"
+	python3 ./runners/flink.py \
 		--kafka-container "$kafka_container" \
+		--kafka-port "$kafka_host_port" \
 		--workdir "$work_dir" \
 		--dataset "$dataset" \
-		--queries "$queries" \
-		--parallelism "$parallelism" \
-		--arroyo-container "$arroyo_container" \
-		--no-cleanup "$no_cleanup"
-	log "Arroyo Nexmark benchmark finished"
+		--queries "$queries"
+	log "Flink Nexmark benchmark finished"
 }
 
-arroyo_host_port="$(find_free_port 5115 5215)"
-kafka_host_port="$(find_free_port 9092 9192)"
 prepare_workspace
-ensure_network
+kafka_host_port="$(find_free_port 9092 9192)"
 start_kafka
-start_arroyo
 run_bench
 
 echo "report: $work_dir/report.md"

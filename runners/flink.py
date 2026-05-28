@@ -7,7 +7,7 @@ keyed bid JSONL dataset。当前 Flink runner 固定使用 blackhole sink。
 
 执行方式：
 
-1. `bench_flink.sh` 启动 Kafka，并把 Kafka 地址和工作目录传入本文件。
+1. `benches/flink.sh` 启动 Kafka，并把 Kafka 地址和工作目录传入本文件。
 2. 本文件准备 Flink toolchain，并读取与 dataset 关联的 stats JSON，拿到输入行数和几个 query 的理论输出行数。
 3. 对每个 query：
    - 重建独立的 Kafka topic

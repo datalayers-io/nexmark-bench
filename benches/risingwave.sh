@@ -2,7 +2,7 @@
 
 # 这个脚本是 RisingWave Nexmark benchmark 的本地入口。
 # 它负责准备临时目录、启动 Kafka 和 RisingWave standalone 容器，然后把网络、
-# 端口、镜像、dataset 和工作目录参数传给 `risingwave_bench_runner.py`。真正的
+# 端口、镜像、dataset 和工作目录参数传给 `runners/risingwave.py`。真正的
 # query 执行、指标统计和 report 生成都在 Python runner 里完成。
 
 set -euo pipefail
@@ -12,7 +12,7 @@ usage() {
 运行本地 RisingWave Nexmark benchmark。
 
 Usage:
-  bench_risingwave.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22] [--parallelism N] [--sink table|blackhole]
+  risingwave.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22] [--parallelism N] [--sink table|blackhole]
                       [--bench-root DIR] [--no-cleanup] [--image IMAGE]
 
 参数:
@@ -47,7 +47,7 @@ Usage:
 EOF
 }
 
-project_root="$(cd "$(dirname "$0")" && pwd)"
+project_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$project_root"
 
 log() {
@@ -245,7 +245,7 @@ wait_for_risingwave_kafka_connectivity() {
 run_bench() {
 	# The Python runner performs the actual per-query replay and metric collection.
 	log "Running RisingWave Nexmark benchmark: dataset=$dataset queries=$queries sink=$sink parallelism=$parallelism"
-	python3 ./risingwave_bench_runner.py \
+	python3 ./runners/risingwave.py \
 		--host 127.0.0.1 \
 		--port "$rw_host_port" \
 		--user root \

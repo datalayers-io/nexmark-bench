@@ -41,18 +41,18 @@ bash ./datagen.sh
 
 ## Benchmark 入口
 
-- [bench_datalayers.sh](/home/nsc/nexmark-bench/bench_datalayers.sh:1)
-- [bench_risingwave.sh](/home/nsc/nexmark-bench/bench_risingwave.sh:1)
-- [bench_flink.sh](/home/nsc/nexmark-bench/bench_flink.sh:1)
-- [bench_arroyo.sh](/home/nsc/nexmark-bench/bench_arroyo.sh:1)
+- [benches/datalayers.sh](/home/nsc/nexmark-bench/benches/datalayers.sh:1)
+- [benches/risingwave.sh](/home/nsc/nexmark-bench/benches/risingwave.sh:1)
+- [benches/flink.sh](/home/nsc/nexmark-bench/benches/flink.sh:1)
+- [benches/arroyo.sh](/home/nsc/nexmark-bench/benches/arroyo.sh:1)
 
 核心实现：
 
 - [nexmark_fixture.py](/home/nsc/nexmark-bench/nexmark_fixture.py:1)
-- [datalayers_bench_runner.py](/home/nsc/nexmark-bench/datalayers_bench_runner.py:1)
-- [risingwave_bench_runner.py](/home/nsc/nexmark-bench/risingwave_bench_runner.py:1)
-- [flink_bench_runner.py](/home/nsc/nexmark-bench/flink_bench_runner.py:1)
-- [arroyo_bench_runner.py](/home/nsc/nexmark-bench/arroyo_bench_runner.py:1)
+- [runners/datalayers.py](/home/nsc/nexmark-bench/runners/datalayers.py:1)
+- [runners/risingwave.py](/home/nsc/nexmark-bench/runners/risingwave.py:1)
+- [runners/flink.py](/home/nsc/nexmark-bench/runners/flink.py:1)
+- [runners/arroyo.py](/home/nsc/nexmark-bench/runners/arroyo.py:1)
 
 ## 推荐用法
 
@@ -65,7 +65,7 @@ bash ./datagen.sh
 跑 Datalayers：
 
 ```bash
-bash ./bench_datalayers.sh \
+bash ./benches/datalayers.sh \
   --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
   --queries q0,q1,q2,q14,q21,q22 \
   --sink table \
@@ -76,7 +76,7 @@ bash ./bench_datalayers.sh \
 如果 Datalayers 就运行在默认地址 `127.0.0.1:8361`，可以省略 `--host/--port`：
 
 ```bash
-bash ./bench_datalayers.sh \
+bash ./benches/datalayers.sh \
   --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
   --queries q0,q1,q2,q14,q21,q22 \
   --sink table
@@ -85,7 +85,7 @@ bash ./bench_datalayers.sh \
 跑 RisingWave：
 
 ```bash
-bash ./bench_risingwave.sh \
+bash ./benches/risingwave.sh \
   --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
   --queries q0,q1,q2,q14,q21,q22 \
   --parallelism 1 \
@@ -95,7 +95,7 @@ bash ./bench_risingwave.sh \
 跑 Flink：
 
 ```bash
-bash ./bench_flink.sh \
+bash ./benches/flink.sh \
   --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
   --queries q0,q1,q2,q14,q21,q22
 ```
@@ -103,14 +103,14 @@ bash ./bench_flink.sh \
 跑 Arroyo：
 
 ```bash
-bash ./bench_arroyo.sh \
+bash ./benches/arroyo.sh \
   --dataset /home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl \
   --queries q0,q1,q2,q14,q21,q22
 ```
 
 ## 脚本参数
 
-### `bench_datalayers.sh`
+### `benches/datalayers.sh`
 
 当前只支持连接一个已经启动好的 Datalayers HTTP SQL endpoint。脚本会负责启动 Kafka、preload dataset、执行 benchmark、写 report，并在正式开始前先清理目标 `nexmark_*` benchmark database 的残留对象。
 
@@ -132,7 +132,7 @@ bash ./bench_arroyo.sh \
 - `--no-cleanup`
   保留 Kafka 和 benchmark 创建的对象；未传时会自动 cleanup。无论是否传这个参数，runner 在正式开始前都会先做一轮预清理；cleanup 顺序会先 drop pipeline，再 drop source/sink/table，最后 drop database。
 
-### `bench_risingwave.sh`
+### `benches/risingwave.sh`
 
 主要参数：
 
@@ -152,7 +152,7 @@ bash ./bench_arroyo.sh \
 - `--image IMAGE`
   覆盖默认 RisingWave 镜像。
 
-### `bench_flink.sh`
+### `benches/flink.sh`
 
 主要参数：
 
@@ -169,7 +169,7 @@ bash ./bench_arroyo.sh \
 
 Flink runner 固定使用 blackhole sink。完成判定是 Kafka consumer group lag 到 0 后主动 cancel job。
 
-### `bench_arroyo.sh`
+### `benches/arroyo.sh`
 
 脚本会启动本地 Kafka 容器和一个单容器 Arroyo 实例，然后通过 Arroyo REST API 提交 pipeline。
 
@@ -211,7 +211,7 @@ Arroyo 的完成判定仍基于每个 query 显式指定的 Kafka source consume
 - `avg_mem_gib`
   replay 窗口内的平均 RSS，单位 GiB。
 
-当前 Datalayers runner 会尝试根据 `bench_datalayers.sh` 连接的 HTTP 端口自动探测本机监听 PID，并对该 PID 做采样；如果探测失败，这两个字段会回退为 `0`。
+当前 Datalayers runner 会尝试根据 `benches/datalayers.sh` 连接的 HTTP 端口自动探测本机监听 PID，并对该 PID 做采样；如果探测失败，这两个字段会回退为 `0`。
 - `kafka_preload_sec`
   本轮 query 输入 preload 到 Kafka 的耗时，不计入 `throughput_rps` 分母。
 
