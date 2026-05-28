@@ -892,7 +892,19 @@ def main() -> int:
     sink_mode = SinkMode(args.sink)
 
     sql = RisingWaveSql(args.host, args.port, args.user, args.database)
-    sql.run(f"SET streaming_parallelism = {args.parallelism}")
+
+    deadline = time.time() + 60
+    while True:
+        try:
+            sql.run(f"SET streaming_parallelism = {args.parallelism}")
+            break
+        except BenchError:
+            if time.time() > deadline:
+                raise BenchError(
+                    "RisingWave did not become ready within 60s after port was open"
+                ) from None
+            time.sleep(1)
+
     workdir.mkdir(parents=True, exist_ok=True)
     dataset_path = Path(args.dataset).resolve()
     dataset_stats = load_bid_dataset_stats(dataset_path)
