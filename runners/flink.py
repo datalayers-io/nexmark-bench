@@ -63,6 +63,7 @@ from nexmark_fixture import load_bid_dataset_stats, prepare_flink_toolchain
 
 RESET = "\033[0m"
 GREEN = "\033[32m"
+YELLOW = "\033[33m"
 FLINK_JAVA_OPTS = (
     "--add-exports=java.base/sun.net.util=ALL-UNNAMED "
     "--add-opens=java.base/java.lang=ALL-UNNAMED "
@@ -286,6 +287,20 @@ def log(message: str, *, color: str | None = None) -> None:
         print(f"[{now} UTC] {message}", flush=True)
     else:
         print(f"{color}[{now} UTC] {message}{RESET}", flush=True)
+
+
+def log_cli_args(args: argparse.Namespace) -> None:
+    log(
+        f"CLI args: {json.dumps(vars(args), sort_keys=True, default=str)}",
+        color=YELLOW,
+    )
+
+
+def log_sql(label: str, sql_text: str) -> None:
+    log(
+        f"{label} SQL:\n---8<---\n{sql_text.strip()}\n--->8---",
+        color=YELLOW,
+    )
 
 
 class MultiProcessMonitor:
@@ -712,9 +727,6 @@ def parse_args() -> argparse.Namespace:
         help="用于 Kafka preload 的 keyed JSONL dataset 路径。",
     )
     parser.add_argument(
-        "--partitions", type=int, default=4, help="Kafka topic 分区数。"
-    )
-    parser.add_argument(
         "--queries",
         default="q0,q1,q2,q14,q21,q22,q16,q17",
         help="逗号分隔的 query 列表。",
@@ -770,6 +782,7 @@ def find_free_port(start: int, end: int) -> int:
 
 def main() -> int:
     args = parse_args()
+    log_cli_args(args)
     log(
         f"Starting Flink Nexmark benchmark: dataset={args.dataset} queries={args.queries} "
         f"workdir={args.workdir} kafka_port={args.kafka_port} parallelism={args.parallelism}"
@@ -788,6 +801,7 @@ def main() -> int:
 
     dataset_path = Path(args.dataset).resolve()
     dataset_stats = load_bid_dataset_stats(dataset_path)
+    topic_partitions = dataset_stats["partitions"]
     fixture_metadata = {"dataset_path": str(dataset_path)}
     rest_port = find_free_port(18081, 18181)
     runtime_flink, _runtime_nexmark = create_runtime(
@@ -810,12 +824,15 @@ def main() -> int:
         for query in queries:
             log(f"Starting benchmark for query {query.name}", color=GREEN)
             topic = f"nexmark_{query.name}"
-            ensure_topic(args.kafka_container, topic, args.partitions)
+            ensure_topic(args.kafka_container, topic, topic_partitions)
             kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
             sql_file = workdir / f"{query.name}.sql"
-            sql_file.write_text(
-                render_sql(topic, query, args.kafka_port), encoding="utf-8"
+            sql_text = render_sql(topic, query, args.kafka_port)
+            log_sql(
+                f"Create source, blackhole sink, and submit INSERT job for {query.name}",
+                sql_text,
             )
+            sql_file.write_text(sql_text, encoding="utf-8")
             sample_csv = workdir / f"{query.name}_samples.csv"
             monitor = MultiProcessMonitor(
                 lambda: flink_pids(runtime_flink), sample_csv, args.sample_interval

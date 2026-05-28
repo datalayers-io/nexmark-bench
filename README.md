@@ -9,6 +9,7 @@
 - `nexmark_fixture.py` 会使用官方 `nexmark-flink` datagen 生成 combined Nexmark events，然后抽取 `Bid` 事件。
 - 抽取出的 bid 会被扁平化，并写入稳定命名的 keyed JSONL 文件，默认是 [nexmark_bid.keyed.jsonl](/home/nsc/nexmark-bench/nexmark_bid.keyed.jsonl)。
 - datagen 会同时写出与 dataset 同名关联的 stats JSON；默认 stats 文件是 [nexmark_bid.keyed.stats.json](/home/nsc/nexmark-bench/nexmark_bid.keyed.stats.json)。
+- stats JSON 会记录该 dataset 生成时使用的 `partitions`，各 runner 会直接从这里读取 Kafka topic 分区数。
 - benchmark 脚本不再在运行时临时生成 fixture。它们只接收 `--dataset`，默认指向仓库根目录下的稳定 dataset 文件。
 - 当前默认 query 是 `q0,q1,q2,q14,q21,q22,q16,q17`。
 - 当前 throughput 统一定义为 `input_rows / replay_sec`。
@@ -33,7 +34,7 @@ bash ./datagen.sh
 - `--rows N`
   目标 bid 行数，默认 `1000000`（100 万行）。`nexmark-flink` 先生成足够多的 combined events，再从中截取前 `N` 条 bid。
 - `--partitions N`
-  写 keyed dataset 时使用的逻辑 key 数量。默认 `4`。
+  写 keyed dataset 时使用的逻辑 key 数量。默认 `4`。该值也会写入同名 stats JSON，后续 runner 会用它来重建 Kafka topic。
 - `--bench-root DIR`
   datagen 临时工作目录根路径。
 - `--no-cleanup`
@@ -222,6 +223,7 @@ Arroyo 的结果目前也没有 `inserted_rows`，因为当前只支持 blackhol
 dataset stats 里的这些字段是提前从 dataset 扫描得到的：
 
 - `total_rows`
+- `partitions`
 - `q2_expected_rows`
 - `q14_expected_rows`
 - `q21_expected_rows`

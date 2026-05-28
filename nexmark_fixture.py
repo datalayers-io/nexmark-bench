@@ -625,6 +625,7 @@ def scan_bid_dataset(dataset_path: Path) -> dict[str, int]:
 
     stats: dict[str, int] = {
         "total_rows": 0,
+        "partitions": 0,
         "q2_expected_rows": 0,
         "q14_expected_rows": 0,
         "q21_expected_rows": 0,
@@ -633,12 +634,17 @@ def scan_bid_dataset(dataset_path: Path) -> dict[str, int]:
     }
     auction_set: set[int] = set()
     channels_by_date: dict[str, set[str]] = defaultdict(set)
+    keyed_partitions: set[str] = set()
     with dataset_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
-            payload = line.split("\t", 1)[1] if "\t" in line else line
+            if "\t" in line:
+                key, payload = line.split("\t", 1)
+                keyed_partitions.add(key)
+            else:
+                payload = line
             record = json.loads(payload)
             stats["total_rows"] += 1
             if record["auction"] in {1007, 1020, 2001, 2019, 2087}:
@@ -662,6 +668,7 @@ def scan_bid_dataset(dataset_path: Path) -> dict[str, int]:
     stats["q16_expected_rows"] = sum(
         len(channels) for channels in channels_by_date.values()
     )
+    stats["partitions"] = len(keyed_partitions)
     return stats
 
 
@@ -687,6 +694,7 @@ def load_bid_dataset_stats(dataset_path: Path) -> dict[str, int]:
 
     required_keys = {
         "total_rows",
+        "partitions",
         "q2_expected_rows",
         "q14_expected_rows",
         "q21_expected_rows",
@@ -696,7 +704,12 @@ def load_bid_dataset_stats(dataset_path: Path) -> dict[str, int]:
     missing = sorted(required_keys - payload.keys())
     if missing:
         raise ValueError(f"dataset stats file {stats_path} is missing keys: {missing}")
-    return {key: int(payload[key]) for key in required_keys}
+    stats = {key: int(payload[key]) for key in required_keys}
+    if stats["partitions"] <= 0:
+        raise ValueError(
+            f"dataset stats file {stats_path} has invalid partitions={stats['partitions']}"
+        )
+    return stats
 
 
 def _parse_args() -> argparse.Namespace:
@@ -795,6 +808,7 @@ def main() -> int:
         log=_cli_log,
     )
     write_keyed_bid_dataset(result.dataset_path, output_path, args.partitions)
+    result.stats["partitions"] = args.partitions
     stats_output.parent.mkdir(parents=True, exist_ok=True)
     stats_output.write_text(json.dumps(result.stats, indent=2) + "\n", encoding="utf-8")
     _cli_log(f"Wrote keyed dataset to {output_path}")

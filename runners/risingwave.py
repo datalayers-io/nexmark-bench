@@ -67,6 +67,7 @@ from nexmark_fixture import load_bid_dataset_stats
 
 RESET = "\033[0m"
 GREEN = "\033[32m"
+YELLOW = "\033[33m"
 RW_GROUP_ID_PREFIX = "nexmark-rw-consumer"
 RW_METRIC_NAME = "stream_sink_input_row_count"
 
@@ -218,6 +219,20 @@ def log(message: str, *, color: str | None = None) -> None:
         print(f"{color}[{now} UTC] {message}{RESET}", flush=True)
 
 
+def log_cli_args(args: argparse.Namespace) -> None:
+    log(
+        f"CLI args: {json.dumps(vars(args), sort_keys=True, default=str)}",
+        color=YELLOW,
+    )
+
+
+def log_sql(label: str, sql_text: str) -> None:
+    log(
+        f"{label} SQL:\n---8<---\n{sql_text.strip()}\n--->8---",
+        color=YELLOW,
+    )
+
+
 class RisingWaveSql:
     def __init__(self, host: str, port: int, user: str, database: str):
         self.base_cmd = [
@@ -259,6 +274,18 @@ class RisingWaveSql:
             if line.isdigit():
                 return int(line)
         raise BenchError(f"cannot parse scalar result from output: {output}")
+
+
+def configure_benchmark_session(
+    sql: RisingWaveSql, parallelism: int, sink_mode: SinkMode
+) -> None:
+    sql_text = f"SET streaming_parallelism = {parallelism}"
+    log_sql("Configure streaming parallelism", sql_text)
+    sql.run(sql_text)
+    if sink_mode == SinkMode.BLACKHOLE:
+        sql_text = "SET streaming_use_snapshot_backfill = false"
+        log_sql("Disable snapshot backfill for blackhole sink benchmark", sql_text)
+        sql.run(sql_text)
 
 
 class ContainerMonitor:
@@ -684,8 +711,7 @@ def create_source(
 ) -> None:
     # Sources are created per query so each replay starts from a clean earliest offset.
     log(f"Creating RisingWave source {source} for topic {topic}")
-    sql.run(
-        f"""
+    sql_text = f"""
         CREATE SOURCE {source} (
             auction BIGINT,
             bidder BIGINT,
@@ -702,9 +728,9 @@ def create_source(
             group.id.prefix = '{group_id_prefix}',
             scan.startup.mode = 'earliest'
         ) FORMAT PLAIN ENCODE JSON
-        """,
-        timeout=120,
-    )
+        """
+    log_sql(f"Create source for {source}", sql_text)
+    sql.run(sql_text, timeout=120)
 
 
 def source_fragment_id(sql: RisingWaveSql, source: str) -> int:
@@ -720,13 +746,12 @@ def source_fragment_id(sql: RisingWaveSql, source: str) -> int:
 def create_mv(sql: RisingWaveSql, mv: str, source: str, query: QuerySpec) -> None:
     log(f"Creating RisingWave materialized view {mv} for query {query.name}")
     select_sql = query.select_sql.format(source=source)
-    sql.run(
-        f"""
+    sql_text = f"""
         CREATE MATERIALIZED VIEW {mv} AS
         {select_sql}
-        """,
-        timeout=120,
-    )
+        """
+    log_sql(f"Create materialized view for {query.name}", sql_text)
+    sql.run(sql_text, timeout=1800)
 
 
 def create_blackhole_sink(
@@ -734,8 +759,7 @@ def create_blackhole_sink(
 ) -> None:
     log(f"Creating RisingWave blackhole sink {sink} for query {query.name}")
     select_sql = query.select_sql.format(source=source)
-    sql.run(
-        f"""
+    sql_text = f"""
         CREATE SINK {sink} AS
         {select_sql}
         WITH (
@@ -743,9 +767,9 @@ def create_blackhole_sink(
             type = 'append-only',
             force_append_only = 'true'
         )
-        """,
-        timeout=120,
-    )
+        """
+    log_sql(f"Create blackhole sink for {query.name}", sql_text)
+    sql.run(sql_text, timeout=1800)
 
 
 def cleanup_objects(
@@ -781,7 +805,7 @@ def markdown_report(
         f"- Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"- RisingWave container: `{args.rw_container}`",
         f"- Kafka brokers in RisingWave: `{args.rw_kafka_brokers}`",
-        f"- Topic partitions: `{args.partitions}`",
+        f"- Topic partitions: `{dataset_stats['partitions']}`",
         f"- Streaming parallelism: `{args.parallelism}`",
         f"- Fixture: `official keyed bid dataset`",
         f"- Sink mode: `{args.sink}`",
@@ -852,9 +876,6 @@ def parse_args() -> argparse.Namespace:
         help="用于 Kafka preload 的 keyed JSONL dataset 路径。",
     )
     parser.add_argument(
-        "--partitions", type=int, default=4, help="Kafka topic 分区数。"
-    )
-    parser.add_argument(
         "--queries",
         default="q0,q1,q2,q14,q21,q22,q16,q17",
         help="逗号分隔的 query 列表。",
@@ -895,6 +916,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    log_cli_args(args)
     log(
         f"Starting RisingWave Nexmark benchmark: dataset={args.dataset} queries={args.queries} "
         f"sink={args.sink} workdir={args.workdir}"
@@ -924,7 +946,7 @@ def main() -> int:
     deadline = time.time() + 60
     while True:
         try:
-            sql.run(f"SET streaming_parallelism = {args.parallelism}")
+            configure_benchmark_session(sql, args.parallelism, sink_mode)
             break
         except BenchError:
             if time.time() > deadline:
@@ -936,6 +958,7 @@ def main() -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     dataset_path = Path(args.dataset).resolve()
     dataset_stats = load_bid_dataset_stats(dataset_path)
+    topic_partitions = dataset_stats["partitions"]
     fixture_metadata = {"dataset_path": str(dataset_path)}
 
     results: list[dict[str, object]] = []
@@ -947,7 +970,7 @@ def main() -> int:
         target = (
             f"{query.name}_mv" if sink_mode == SinkMode.TABLE else f"{query.name}_bh"
         )
-        ensure_topic(args.kafka_container, topic, args.partitions)
+        ensure_topic(args.kafka_container, topic, topic_partitions)
         if not args.no_cleanup:
             cleanup_objects(sql, target, source, sink_mode)
         try:

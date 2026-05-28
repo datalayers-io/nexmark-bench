@@ -43,6 +43,7 @@ from nexmark_fixture import load_bid_dataset_stats
 
 RESET = "\033[0m"
 GREEN = "\033[32m"
+YELLOW = "\033[33m"
 
 
 @dataclass
@@ -258,6 +259,20 @@ def log(message: str, *, color: str | None = None) -> None:
         print(f"[{now} UTC] {message}", flush=True)
     else:
         print(f"{color}[{now} UTC] {message}{RESET}", flush=True)
+
+
+def log_cli_args(args: argparse.Namespace) -> None:
+    log(
+        f"CLI args: {json.dumps(vars(args), sort_keys=True, default=str)}",
+        color=YELLOW,
+    )
+
+
+def log_sql(label: str, sql_text: str) -> None:
+    log(
+        f"{label} SQL:\n---8<---\n{sql_text.strip()}\n--->8---",
+        color=YELLOW,
+    )
 
 
 class ArroyoApi:
@@ -636,7 +651,7 @@ def markdown_report(
         f"- Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"- Arroyo container: `{args.arroyo_container}`",
         f"- Kafka brokers in Arroyo: `{args.kafka_brokers}`",
-        f"- Topic partitions: `{args.partitions}`",
+        f"- Topic partitions: `{dataset_stats['partitions']}`",
         f"- Pipeline parallelism: `{args.parallelism}`",
         f"- Fixture: `official keyed bid dataset`",
         f"- Sink mode: `{sink_mode}`",
@@ -705,9 +720,6 @@ def parse_args() -> argparse.Namespace:
         help="用于 Kafka preload 的 keyed JSONL dataset 路径。",
     )
     parser.add_argument(
-        "--partitions", type=int, default=4, help="Kafka topic 分区数。"
-    )
-    parser.add_argument(
         "--queries",
         default="q0,q1,q2,q14,q21,q22,q16,q17",
         help="逗号分隔的 query 列表。",
@@ -748,6 +760,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    log_cli_args(args)
     log(
         f"Starting Arroyo Nexmark benchmark: dataset={args.dataset} queries={args.queries} "
         f"host={args.host} port={args.port} workdir={args.workdir}"
@@ -775,6 +788,7 @@ def main() -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     dataset_path = Path(args.dataset).resolve()
     dataset_stats = load_bid_dataset_stats(dataset_path)
+    topic_partitions = dataset_stats["partitions"]
     fixture_metadata = {"dataset_path": str(dataset_path)}
     if args.parallelism < 1:
         raise BenchError("--parallelism must be >= 1")
@@ -791,12 +805,16 @@ def main() -> int:
         sink = f"{query.name}_{'bh' if sink_mode == 'blackhole' else 'tbl'}_{suffix}"
         group = f"nexmark-arroyo-{query.name}-{suffix}"
         pipeline_name = f"nexmark_{query.name}_{suffix}"
-        ensure_topic(args.kafka_container, topic, args.partitions)
+        ensure_topic(args.kafka_container, topic, topic_partitions)
         try:
             kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
             expected_rows = query.expected_rows(dataset_stats)
             sql = render_sql(
                 topic, query, source, sink, args.kafka_brokers, group, sink_mode
+            )
+            log_sql(
+                f"Create source/sink and trigger INSERT pipeline for {query.name}",
+                sql,
             )
             sample_csv = workdir / f"{query.name}_samples.csv"
             monitor = ContainerMonitor(

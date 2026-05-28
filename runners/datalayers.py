@@ -69,6 +69,7 @@ from nexmark_fixture import load_bid_dataset_stats
 
 RESET = "\033[0m"
 GREEN = "\033[32m"
+YELLOW = "\033[33m"
 
 
 @dataclass
@@ -257,6 +258,20 @@ def log(message: str, *, color: str | None = None) -> None:
         print(f"[{now} UTC] {message}", flush=True)
     else:
         print(f"{color}[{now} UTC] {message}{RESET}", flush=True)
+
+
+def log_cli_args(args: argparse.Namespace) -> None:
+    log(
+        f"CLI args: {json.dumps(vars(args), sort_keys=True, default=str)}",
+        color=YELLOW,
+    )
+
+
+def log_sql(label: str, sql_text: str) -> None:
+    log(
+        f"{label} SQL:\n---8<---\n{sql_text.strip()}\n--->8---",
+        color=YELLOW,
+    )
 
 
 class DatalayersHttpSql:
@@ -558,7 +573,9 @@ def pipeline_state(sql: DatalayersHttpSql, database: str, pipeline: str) -> str:
 
 def create_database(sql: DatalayersHttpSql, database: str) -> None:
     log(f"Creating benchmark database {database}")
-    sql.run(f"CREATE DATABASE IF NOT EXISTS {database}")
+    sql_text = f"CREATE DATABASE IF NOT EXISTS {database}"
+    log_sql("Create benchmark database", sql_text)
+    sql.run(sql_text)
 
 
 def create_table_sink(
@@ -567,8 +584,7 @@ def create_table_sink(
     query: QuerySpec,
 ) -> str:
     sink = f"{query.name}_sink"
-    sql.run(
-        f"""
+    sql_text = f"""
         CREATE TABLE {sink} (
             {query.sink_columns}
         )
@@ -576,9 +592,9 @@ def create_table_sink(
         WITH (memtable_size=1024MB)
         PARTITION BY HASH(auction)
         PARTITIONS 4
-        """,
-        database=database,
-    )
+        """
+    log_sql(f"Create table sink for {query.name}", sql_text)
+    sql.run(sql_text, database=database)
     return sink
 
 
@@ -586,7 +602,9 @@ def create_blackhole_sink(
     sql: DatalayersHttpSql, database: str, query: QuerySpec
 ) -> str:
     sink = f"{query.name}_bh"
-    sql.run(f"CREATE SINK {sink} WITH (connector='blackhole')", database=database)
+    sql_text = f"CREATE SINK {sink} WITH (connector='blackhole')"
+    log_sql(f"Create blackhole sink for {query.name}", sql_text)
+    sql.run(sql_text, database=database)
     return sink
 
 
@@ -605,8 +623,7 @@ def create_source_and_pipeline(
     log(
         f"Creating source {database}.{source} and pipeline {database}.{pipeline} for query {query.name}"
     )
-    sql.run(
-        f"""
+    source_sql = f"""
         CREATE SOURCE {source} (
             ts TIMESTAMP(9),
             auction BIGINT,
@@ -623,19 +640,17 @@ def create_source_and_pipeline(
             format='json',
             bad_data='fail'
         )
-        """,
-        database=database,
-    )
-    sql.run(
-        f"""
+        """
+    pipeline_sql = f"""
         CREATE PIPELINE {pipeline}
         SINK TO {sink}
         AS
         {query.select_sql.format(source=source)}
-        """,
-        database=database,
-        timeout=120,
-    )
+        """
+    log_sql(f"Create source for {query.name}", source_sql)
+    sql.run(source_sql, database=database)
+    log_sql(f"Create pipeline for {query.name}", pipeline_sql)
+    sql.run(pipeline_sql, database=database, timeout=120)
     return source, pipeline
 
 
@@ -670,7 +685,8 @@ def cleanup_objects(
         except Exception:
             pass
     try:
-        sql.run(f"DROP DATABASE {database}")
+        statement = f"DROP DATABASE {database}"
+        sql.run(statement)
     except Exception:
         pass
 
@@ -701,7 +717,8 @@ def preclean_benchmark_databases(
             except Exception:
                 pass
         try:
-            sql.run(f"DROP DATABASE {database}")
+            statement = f"DROP DATABASE {database}"
+            sql.run(statement)
         except Exception:
             pass
 
@@ -718,7 +735,7 @@ def markdown_report(
         "",
         f"- Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"- Kafka brokers: `{args.kafka_brokers}`",
-        f"- Topic partitions: `{args.partitions}`",
+        f"- Topic partitions: `{dataset_stats['partitions']}`",
         f"- Fixture: `official keyed bid dataset`",
         f"- Sink mode: `{args.sink}`",
         f"- Input rows: `{dataset_stats['total_rows']}`",
@@ -799,9 +816,6 @@ def parse_args() -> argparse.Namespace:
         help="用于 Kafka preload 的 keyed JSONL dataset 路径。",
     )
     parser.add_argument(
-        "--partitions", type=int, default=4, help="Kafka topic 分区数。"
-    )
-    parser.add_argument(
         "--queries",
         default="q0,q1,q2,q14,q21,q22,q16,q17",
         help="逗号分隔的 query 列表。",
@@ -841,6 +855,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    log_cli_args(args)
     log(
         f"Starting Datalayers Nexmark benchmark: dataset={args.dataset} queries={args.queries} "
         f"sink={args.sink} host={args.host} port={args.port} workdir={args.workdir}"
@@ -870,6 +885,7 @@ def main() -> int:
 
     dataset_path = Path(args.dataset).resolve()
     dataset_stats = load_bid_dataset_stats(dataset_path)
+    topic_partitions = dataset_stats["partitions"]
     fixture_metadata = {"dataset_path": str(dataset_path)}
     preclean_benchmark_databases(sql, queries, sink_mode)
 
@@ -897,7 +913,7 @@ def main() -> int:
         log(f"Starting benchmark for query {query.name}", color=GREEN)
         topic = f"nexmark_{query.name}"
         database = f"nexmark_{query.name}"
-        ensure_topic(args.kafka_container, topic, args.partitions)
+        ensure_topic(args.kafka_container, topic, topic_partitions)
         source = ""
         sink = ""
         pipeline = ""
@@ -981,7 +997,7 @@ def main() -> int:
                 cleanup_objects(sql, database, source, sink, pipeline, sink_mode)
             if not args.no_cleanup:
                 try:
-                    ensure_topic(args.kafka_container, topic, args.partitions)
+                    ensure_topic(args.kafka_container, topic, topic_partitions)
                 except Exception:
                     pass
 

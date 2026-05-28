@@ -120,6 +120,7 @@ if [[ -z "$bench_root" ]]; then
 fi
 work_dir="$bench_root/risingwave"
 risingwave_store_dir="$work_dir/risingwave-store"
+rw_config_path="$work_dir/risingwave-bench.toml"
 run_id="$(basename "$bench_root" | tr -c '[:alnum:]' '-')"
 kafka_network="risingwave-nexmark-net-${run_id}"
 kafka_container="risingwave-nexmark-kafka-${run_id}"
@@ -176,6 +177,13 @@ prepare_workspace() {
 	pre_cleanup
 	rm -rf "$work_dir"
 	mkdir -p "$work_dir" "$risingwave_store_dir"
+	cat >"$rw_config_path" <<'EOF'
+[storage]
+block_cache_capacity_mb = 2048
+meta_cache_capacity_mb = 512
+compactor_memory_limit_mb = 2560
+shared_buffer_capacity_mb = 2048
+EOF
 }
 
 ensure_network() {
@@ -230,8 +238,10 @@ start_risingwave() {
 		--label risingwave.nexmark.run_id="$run_id" \
 		-p "${rw_host_port}:4566" \
 		-v "$risingwave_store_dir:/risingwave/store" \
+		-v "$rw_config_path:/risingwave/config/risingwave-bench.toml:ro" \
 		"$rw_image" \
 		single_node \
+		--config-path /risingwave/config/risingwave-bench.toml \
 		--store-directory /risingwave/store \
 		--listen-addr 0.0.0.0:4566 \
 		--parallelism "$parallelism" >/dev/null
