@@ -289,9 +289,10 @@ class RisingWaveSql:
 def configure_benchmark_session(
     sql: RisingWaveSql, parallelism: int, sink_mode: SinkMode
 ) -> None:
-    statements = [f"SET streaming_parallelism = {parallelism}"]
-    if sink_mode == SinkMode.BLACKHOLE:
-        statements.append("SET streaming_use_snapshot_backfill = false")
+    statements = [
+        f"SET streaming_parallelism = {parallelism}",
+        "SET streaming_use_snapshot_backfill = false",
+    ]
     sql.set_session_statements(statements)
     for index, statement in enumerate(statements):
         if index == 0:
@@ -832,25 +833,35 @@ def create_mv(sql: RisingWaveSql, mv: str, source: str, query: QuerySpec) -> Non
 
 
 def create_blackhole_sink(
-    sql: RisingWaveSql, sink: str, source: str, query: QuerySpec
+    sql: RisingWaveSql, sink: str, source: str, query: QuerySpec, mv_backing: str
 ) -> None:
-    log(f"Creating RisingWave blackhole sink {sink} for query {query.name}")
+    log(
+        f"Creating RisingWave intermediate MV {mv_backing} for blackhole sink {sink}"
+    )
     select_sql = query.select_sql.format(source=source)
-    sql_text = f"""
-        CREATE SINK {sink} AS
+    mv_text = f"""
+        CREATE MATERIALIZED VIEW {mv_backing} AS
         {select_sql}
+        """
+    log_sql(f"Create intermediate MV for {query.name}", mv_text)
+    sql.run(mv_text, timeout=1800)
+
+    log(f"Creating RisingWave blackhole sink {sink} from MV {mv_backing}")
+    sink_text = f"""
+        CREATE SINK {sink} FROM {mv_backing}
         WITH (
             connector = 'blackhole',
             type = 'append-only',
-            force_append_only = 'true'
+            force_append_only = 'true',
+            snapshot = 'false'
         )
         """
-    log_sql(f"Create blackhole sink for {query.name}", sql_text)
-    sql.run(sql_text, timeout=1800)
+    log_sql(f"Create blackhole sink for {query.name}", sink_text)
+    sql.run(sink_text, timeout=1800)
 
 
 def cleanup_objects(
-    sql: RisingWaveSql, target: str, source: str, sink_mode: SinkMode
+    sql: RisingWaveSql, target: str, source: str, sink_mode: SinkMode, mv_backing: str = ""
 ) -> None:
     log(f"Cleaning up RisingWave objects source={source} target={target}")
     if sink_mode == SinkMode.TABLE:
@@ -863,6 +874,8 @@ def cleanup_objects(
             f"DROP SINK IF EXISTS {target}",
             f"DROP SOURCE IF EXISTS {source}",
         ]
+        if mv_backing:
+            statements.append(f"DROP MATERIALIZED VIEW IF EXISTS {mv_backing}")
     for statement in statements:
         try:
             sql.run(statement)
@@ -1047,6 +1060,7 @@ def main() -> int:
         target = (
             f"{query.name}_mv" if sink_mode == SinkMode.TABLE else f"{query.name}_bh"
         )
+        mv_backing = f"{query.name}_mv_bh" if sink_mode == SinkMode.BLACKHOLE else ""
         total_rows = dataset_stats["total_rows"]
         existing = count_kafka_messages(args.kafka_container, topic)
         skip_preload = existing is not None and existing == total_rows
@@ -1059,7 +1073,7 @@ def main() -> int:
                 )
             ensure_topic(args.kafka_container, topic, topic_partitions)
         if not args.no_cleanup:
-            cleanup_objects(sql, target, source, sink_mode)
+            cleanup_objects(sql, target, source, sink_mode, mv_backing)
         try:
             if skip_preload:
                 kafka_preload_sec = 0.0
@@ -1079,7 +1093,7 @@ def main() -> int:
             if sink_mode == SinkMode.TABLE:
                 create_mv(sql, target, source, query)
             else:
-                create_blackhole_sink(sql, target, source, query)
+                create_blackhole_sink(sql, target, source, query, mv_backing)
             replay_t0 = time.time()
             log(f"Starting replay window for query {query.name}")
             monitor.start()
@@ -1135,7 +1149,7 @@ def main() -> int:
             )
         finally:
             if not args.no_cleanup:
-                cleanup_objects(sql, target, source, sink_mode)
+                cleanup_objects(sql, target, source, sink_mode, mv_backing)
 
     report_md.write_text(
         markdown_report(args, dataset_stats, results), encoding="utf-8"
