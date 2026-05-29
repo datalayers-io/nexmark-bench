@@ -291,8 +291,6 @@ def configure_benchmark_session(
 ) -> None:
     statements = [
         f"SET streaming_parallelism = {parallelism}",
-        "SET streaming_use_snapshot_backfill = false",
-        "SET streaming_use_arrangement_backfill = false",
     ]
     sql.set_session_statements(statements)
     for index, statement in enumerate(statements):
@@ -302,6 +300,9 @@ def configure_benchmark_session(
             log_sql("Configure benchmark session", statement)
 
 
+_CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+
+
 class ContainerMonitor:
     def __init__(self, container: str, output_csv: Path, sample_interval: float):
         self.container = container
@@ -309,6 +310,11 @@ class ContainerMonitor:
         self.sample_interval = sample_interval
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._prev_utime: int | None = None
+        self._prev_stime: int | None = None
+        self._prev_ts: float | None = None
+        self._cgroup_procs_path: str | None = None
+        self._pagesize = os.sysconf(os.sysconf_names["SC_PAGESIZE"])
 
     def start(self) -> None:
         self.output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -325,38 +331,87 @@ class ContainerMonitor:
             writer = csv.writer(fh)
             writer.writerow(["ts_epoch", "cpu_percent", "rss_kib"])
             while not self._stop.is_set():
-                sample = read_container_sample(self.container)
+                sample = self._read_sample()
                 if sample is not None:
                     writer.writerow(sample)
                     fh.flush()
                 time.sleep(self.sample_interval)
 
+    def _resolve_cgroup(self, pid: str) -> None:
+        if self._cgroup_procs_path is not None:
+            return
+        try:
+            with open(f"/proc/{pid}/cgroup", "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if ":name=systemd:" in line or line.startswith("0::"):
+                        cgroup_path = line.split(":", 2)[-1]
+                        procs_path = f"/sys/fs/cgroup{cgroup_path}/cgroup.procs"
+                        if os.path.isfile(procs_path):
+                            self._cgroup_procs_path = procs_path
+                            return
+        except (FileNotFoundError, PermissionError):
+            pass
 
-def read_container_sample(container: str) -> tuple[float, float, int] | None:
-    cmd = [
-        "docker",
-        "exec",
-        container,
-        "ps",
-        "-p",
-        "1",
-        "-o",
-        "%cpu=",
-        "-o",
-        "rss=",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-    if result.returncode != 0:
-        return None
-    fields = result.stdout.strip().split()
-    if len(fields) < 2:
-        return None
-    try:
-        cpu_percent = float(fields[0])
-        rss_kib = int(fields[1])
-    except ValueError:
-        return None
-    return time.time(), cpu_percent, rss_kib
+    def _read_sample(self) -> tuple[float, float, int] | None:
+        pid_result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Pid}}", self.container],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if pid_result.returncode != 0:
+            return None
+        cpid = pid_result.stdout.strip()
+        if not cpid or cpid == "0":
+            return None
+        self._resolve_cgroup(cpid)
+        if self._cgroup_procs_path is None:
+            return None
+        try:
+            with open(self._cgroup_procs_path, "r") as f:
+                pids = [line.strip() for line in f if line.strip()]
+        except (FileNotFoundError, PermissionError):
+            return None
+        total_utime = 0
+        total_stime = 0
+        total_rss = 0
+        any_found = False
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/stat", "r") as f:
+                    content = f.read()
+            except (FileNotFoundError, PermissionError):
+                continue
+            close_paren = content.rfind(")")
+            if close_paren < 0:
+                continue
+            fields = content[close_paren + 2 :].split()
+            if len(fields) < 22:
+                continue
+            try:
+                total_utime += int(fields[11])
+                total_stime += int(fields[12])
+                total_rss += int(fields[21])
+                any_found = True
+            except (IndexError, ValueError):
+                continue
+        if not any_found:
+            return None
+        rss_kib = (total_rss * self._pagesize) // 1024
+        now = time.time()
+        cpu_pct = 0.0
+        if self._prev_ts is not None and self._prev_utime is not None:
+            delta_cpu = (total_utime - self._prev_utime) + (
+                total_stime - self._prev_stime
+            )
+            delta_time = now - self._prev_ts
+            if delta_time > 0:
+                cpu_pct = (delta_cpu / _CLK_TCK) / delta_time * 100.0
+        self._prev_utime = total_utime
+        self._prev_stime = total_stime
+        self._prev_ts = now
+        return now, cpu_pct, rss_kib
 
 
 def summarize_samples(path: Path) -> tuple[float, float]:
@@ -834,37 +889,25 @@ def create_mv(sql: RisingWaveSql, mv: str, source: str, query: QuerySpec) -> Non
 
 
 def create_blackhole_sink(
-    sql: RisingWaveSql, sink: str, source: str, query: QuerySpec, mv_backing: str
+    sql: RisingWaveSql, sink: str, source: str, query: QuerySpec
 ) -> None:
-    log(f"Creating RisingWave intermediate MV {mv_backing} for blackhole sink {sink}")
+    log(f"Creating RisingWave blackhole sink {sink} for query {query.name}")
     select_sql = query.select_sql.format(source=source)
-    mv_text = f"""
-        CREATE MATERIALIZED VIEW {mv_backing} AS
+    sql_text = f"""
+        CREATE SINK {sink} AS
         {select_sql}
-        """
-    log_sql(f"Create intermediate MV for {query.name}", mv_text)
-    sql.run(mv_text, timeout=1800)
-
-    log(f"Creating RisingWave blackhole sink {sink} from MV {mv_backing}")
-    sink_text = f"""
-        CREATE SINK {sink} FROM {mv_backing}
         WITH (
             connector = 'blackhole',
             type = 'append-only',
-            force_append_only = 'true',
-            snapshot = 'false'
+            force_append_only = 'true'
         )
         """
-    log_sql(f"Create blackhole sink for {query.name}", sink_text)
-    sql.run(sink_text, timeout=1800)
+    log_sql(f"Create blackhole sink for {query.name}", sql_text)
+    sql.run(sql_text, timeout=1800)
 
 
 def cleanup_objects(
-    sql: RisingWaveSql,
-    target: str,
-    source: str,
-    sink_mode: SinkMode,
-    mv_backing: str = "",
+    sql: RisingWaveSql, target: str, source: str, sink_mode: SinkMode
 ) -> None:
     log(f"Cleaning up RisingWave objects source={source} target={target}")
     if sink_mode == SinkMode.TABLE:
@@ -877,8 +920,6 @@ def cleanup_objects(
             f"DROP SINK IF EXISTS {target}",
             f"DROP SOURCE IF EXISTS {source}",
         ]
-        if mv_backing:
-            statements.append(f"DROP MATERIALIZED VIEW IF EXISTS {mv_backing}")
     for statement in statements:
         try:
             sql.run(statement)
@@ -1063,7 +1104,6 @@ def main() -> int:
         target = (
             f"{query.name}_mv" if sink_mode == SinkMode.TABLE else f"{query.name}_bh"
         )
-        mv_backing = f"{query.name}_mv_bh" if sink_mode == SinkMode.BLACKHOLE else ""
         total_rows = dataset_stats["total_rows"]
         existing = count_kafka_messages(args.kafka_container, topic)
         skip_preload = existing is not None and existing == total_rows
@@ -1076,7 +1116,7 @@ def main() -> int:
                 )
             ensure_topic(args.kafka_container, topic, topic_partitions)
         if not args.no_cleanup:
-            cleanup_objects(sql, target, source, sink_mode, mv_backing)
+            cleanup_objects(sql, target, source, sink_mode)
         try:
             if skip_preload:
                 kafka_preload_sec = 0.0
@@ -1091,41 +1131,116 @@ def main() -> int:
             )
             group_id_prefix = f"{RW_GROUP_ID_PREFIX}-{source}"
             create_source(sql, source, topic, args.rw_kafka_brokers, group_id_prefix)
-            fragment_id = source_fragment_id(sql, source)
-            group = f"{group_id_prefix}-{fragment_id}"
-            if sink_mode == SinkMode.TABLE:
-                create_mv(sql, target, source, query)
-            else:
-                create_blackhole_sink(sql, target, source, query, mv_backing)
             replay_t0 = time.time()
             log(f"Starting replay window for query {query.name}")
+            log(f"Monitoring RisingWave container: {args.rw_container}")
             monitor.start()
+            progress_stop = threading.Event()
+            pagesize = os.sysconf(os.sysconf_names["SC_PAGESIZE"])
+            prev = {"utime": 0, "stime": 0, "ts": 0.0}
+            cgroup_cache: dict[str, str | None] = {}
+
+            def _log_progress() -> None:
+                while not progress_stop.is_set():
+                    try:
+                        pid_result = subprocess.run(
+                            [
+                                "docker",
+                                "inspect",
+                                "-f",
+                                "{{.State.Pid}}",
+                                args.rw_container,
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        if pid_result.returncode != 0:
+                            raise Exception("docker inspect failed")
+                        cpid = pid_result.stdout.strip()
+                        if not cpid or cpid == "0":
+                            raise Exception("no container pid")
+                        cache_key = f"{args.rw_container}"
+                        procs_path = cgroup_cache.get(cache_key, "")
+                        if not procs_path:
+                            try:
+                                with open(f"/proc/{cpid}/cgroup", "r") as f:
+                                    for line in f:
+                                        line = line.strip()
+                                        if ":name=systemd:" in line or line.startswith(
+                                            "0::"
+                                        ):
+                                            cg = line.split(":", 2)[-1]
+                                            pp = f"/sys/fs/cgroup{cg}/cgroup.procs"
+                                            if os.path.isfile(pp):
+                                                procs_path = pp
+                                                cgroup_cache[cache_key] = pp
+                                                break
+                            except Exception:
+                                pass
+                        if not procs_path:
+                            raise Exception("no cgroup procs")
+                        with open(procs_path, "r") as f:
+                            pids = [line.strip() for line in f if line.strip()]
+                        total_utime = 0
+                        total_stime = 0
+                        total_rss = 0
+                        for pid in pids:
+                            try:
+                                with open(f"/proc/{pid}/stat", "r") as f:
+                                    content = f.read()
+                            except Exception:
+                                continue
+                            close_paren = content.rfind(")")
+                            if close_paren < 0:
+                                continue
+                            fields = content[close_paren + 2 :].split()
+                            if len(fields) < 22:
+                                continue
+                            try:
+                                total_utime += int(fields[11])
+                                total_stime += int(fields[12])
+                                total_rss += int(fields[21])
+                            except (IndexError, ValueError):
+                                continue
+                        rss_kib = (total_rss * pagesize) // 1024
+                        now = time.time()
+                        cpu_pct = 0.0
+                        if prev["ts"] > 0:
+                            delta = (total_utime - prev["utime"]) + (
+                                total_stime - prev["stime"]
+                            )
+                            dt = now - prev["ts"]
+                            if dt > 0:
+                                cpu_pct = (delta / _CLK_TCK) / dt * 100.0
+                        prev["utime"] = total_utime
+                        prev["stime"] = total_stime
+                        prev["ts"] = now
+                        log(f"CPU={cpu_pct:.1f}% RES={rss_kib / 1024 / 1024:.2f} GiB")
+                    except Exception:
+                        pass
+                    progress_stop.wait(1.0)
+
+            progress_thread = threading.Thread(target=_log_progress, daemon=True)
+            progress_thread.start()
             try:
                 if sink_mode == SinkMode.TABLE:
-                    inserted_rows = wait_for_count(
-                        sql,
-                        target,
-                        expected_rows,
-                        args.kafka_container,
-                        group,
-                        topic,
-                        args.timeout,
+                    create_mv(sql, target, source, query)
+                else:
+                    create_blackhole_sink(sql, target, source, query)
+                replay_t1 = time.time()
+                if sink_mode == SinkMode.TABLE:
+                    inserted_rows = sql.scalar_i64(
+                        f"SELECT COUNT(*) FROM {target}", timeout=30
                     )
                 else:
                     target_sink_id = sink_id(sql, target)
-                    inserted_rows = wait_for_sink_input_rows(
-                        args.rw_container,
-                        target,
-                        target_sink_id,
-                        args.kafka_container,
-                        group,
-                        topic,
-                        expected_rows,
-                        args.timeout,
+                    inserted_rows = sink_input_row_count(
+                        args.rw_container, target_sink_id
                     )
             finally:
+                progress_stop.set()
                 monitor.stop()
-            replay_t1 = time.time()
             replay_sec = replay_t1 - replay_t0
             avg_cpu_percent, avg_mem_gib = summarize_samples(sample_csv)
             log(
@@ -1152,7 +1267,7 @@ def main() -> int:
             )
         finally:
             if not args.no_cleanup:
-                cleanup_objects(sql, target, source, sink_mode, mv_backing)
+                cleanup_objects(sql, target, source, sink_mode)
 
     report_md.write_text(
         markdown_report(args, dataset_stats, results), encoding="utf-8"

@@ -333,7 +333,7 @@ class ProcessMonitor:
         self._prev_utime: int | None = None
         self._prev_stime: int | None = None
         self._prev_ts: float | None = None
-        self._cgroup_procs_path: str | None = None
+        self._pagesize = os.sysconf(os.sysconf_names["SC_PAGESIZE"])
 
     def start(self) -> None:
         self.output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -356,76 +356,35 @@ class ProcessMonitor:
                     fh.flush()
                 time.sleep(self.sample_interval)
 
-    def _resolve_cgroup(self) -> None:
-        if self._cgroup_procs_path is not None:
-            return
-        try:
-            with open(f"/proc/{self.pid}/cgroup", "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if ":name=systemd:" in line or line.startswith("0::"):
-                        cgroup_path = line.split(":", 2)[-1]
-                        procs_path = f"/sys/fs/cgroup{cgroup_path}/cgroup.procs"
-                        if os.path.isfile(procs_path):
-                            self._cgroup_procs_path = procs_path
-                            return
-        except (FileNotFoundError, PermissionError):
-            pass
-
-    def _read_proc_stats(self) -> tuple[int, int, int] | None:
-        if self._cgroup_procs_path is None:
-            return None
-        pagesize = os.sysconf(os.sysconf_names["SC_PAGESIZE"])
-        total_utime = 0
-        total_stime = 0
-        total_rss = 0
-        try:
-            with open(self._cgroup_procs_path, "r") as f:
-                pids = [line.strip() for line in f if line.strip()]
-        except (FileNotFoundError, PermissionError):
-            return None
-        for pid in pids:
-            try:
-                with open(f"/proc/{pid}/stat", "r") as f:
-                    content = f.read()
-            except (FileNotFoundError, PermissionError):
-                continue
-            close_paren = content.rfind(")")
-            if close_paren < 0:
-                continue
-            fields = content[close_paren + 2 :].split()
-            if len(fields) < 22:
-                continue
-            try:
-                total_utime += int(fields[11])
-                total_stime += int(fields[12])
-                total_rss += int(fields[21])
-            except (IndexError, ValueError):
-                continue
-        rss_kib = (total_rss * pagesize) // 1024
-        return total_utime, total_stime, rss_kib
-
     def _read_sample(self) -> tuple[float, float, int] | None:
-        self._resolve_cgroup()
-        stat = self._read_proc_stats()
-        if stat is None:
+        try:
+            with open(f"/proc/{self.pid}/stat", "r") as f:
+                content = f.read()
+        except (FileNotFoundError, PermissionError):
             return None
-        utime, stime, rss_kib = stat
+        close_paren = content.rfind(")")
+        if close_paren < 0:
+            return None
+        fields = content[close_paren + 2 :].split()
+        if len(fields) < 22:
+            return None
+        try:
+            utime = int(fields[11])
+            stime = int(fields[12])
+            rss_kib = (int(fields[21]) * self._pagesize) // 1024
+        except (IndexError, ValueError):
+            return None
         now = time.time()
-        cpu_percent: float = 0.0
-        if (
-            self._prev_ts is not None
-            and self._prev_utime is not None
-            and self._prev_stime is not None
-        ):
+        cpu_pct = 0.0
+        if self._prev_ts is not None and self._prev_utime is not None:
             delta_cpu = (utime - self._prev_utime) + (stime - self._prev_stime)
             delta_time = now - self._prev_ts
             if delta_time > 0:
-                cpu_percent = (delta_cpu / _CLK_TCK) / delta_time * 100.0
+                cpu_pct = (delta_cpu / _CLK_TCK) / delta_time * 100.0
         self._prev_utime = utime
         self._prev_stime = stime
         self._prev_ts = now
-        return now, cpu_percent, rss_kib
+        return now, cpu_pct, rss_kib
 
 
 def read_process_sample(pid: int) -> tuple[float, float, int] | None:
@@ -1095,7 +1054,7 @@ def main() -> int:
                             prev["stime"] = stime
                             prev["ts"] = now
                             log(
-                                f"CPU={cpu_pct:.1f}% RSS={rss_kib / 1024 / 1024:.2f} GiB"
+                                f"CPU={cpu_pct:.1f}% RES={rss_kib / 1024 / 1024:.2f} GiB"
                             )
                         except Exception:
                             pass

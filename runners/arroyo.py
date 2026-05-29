@@ -326,6 +326,7 @@ class ContainerMonitor:
         self._prev_stime: int | None = None
         self._prev_ts: float | None = None
         self._cgroup_procs_path: str | None = None
+        self._pagesize = os.sysconf(os.sysconf_names["SC_PAGESIZE"])
 
     def start(self) -> None:
         self.output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -364,18 +365,30 @@ class ContainerMonitor:
         except (FileNotFoundError, PermissionError):
             pass
 
-    def _read_proc_stats(self) -> tuple[int, int, int] | None:
+    def _read_sample(self) -> tuple[float, float, int] | None:
+        pid_result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Pid}}", self.container],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if pid_result.returncode != 0:
+            return None
+        cpid = pid_result.stdout.strip()
+        if not cpid or cpid == "0":
+            return None
+        self._resolve_cgroup(cpid)
         if self._cgroup_procs_path is None:
             return None
-        pagesize = os.sysconf(os.sysconf_names["SC_PAGESIZE"])
-        total_utime = 0
-        total_stime = 0
-        total_rss = 0
         try:
             with open(self._cgroup_procs_path, "r") as f:
                 pids = [line.strip() for line in f if line.strip()]
         except (FileNotFoundError, PermissionError):
             return None
+        total_utime = 0
+        total_stime = 0
+        total_rss = 0
+        any_found = False
         for pid in pids:
             try:
                 with open(f"/proc/{pid}/stat", "r") as f:
@@ -392,49 +405,25 @@ class ContainerMonitor:
                 total_utime += int(fields[11])
                 total_stime += int(fields[12])
                 total_rss += int(fields[21])
+                any_found = True
             except (IndexError, ValueError):
                 continue
-        rss_kib = (total_rss * pagesize) // 1024
-        return total_utime, total_stime, rss_kib
-
-    def _get_pid(self) -> str | None:
-        result = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Pid}}", self.container],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
+        if not any_found:
             return None
-        pid = result.stdout.strip()
-        if not pid or pid == "0":
-            return None
-        self._resolve_cgroup(pid)
-        return pid
-
-    def _read_sample(self) -> tuple[float, float, int] | None:
-        pid = self._get_pid()
-        if not pid:
-            return None
-        stat = self._read_proc_stats()
-        if stat is None:
-            return None
-        utime, stime, rss_kib = stat
+        rss_kib = (total_rss * self._pagesize) // 1024
         now = time.time()
-        cpu_percent: float = 0.0
-        if (
-            self._prev_ts is not None
-            and self._prev_utime is not None
-            and self._prev_stime is not None
-        ):
-            delta_cpu = (utime - self._prev_utime) + (stime - self._prev_stime)
+        cpu_pct = 0.0
+        if self._prev_ts is not None and self._prev_utime is not None:
+            delta_cpu = (total_utime - self._prev_utime) + (
+                total_stime - self._prev_stime
+            )
             delta_time = now - self._prev_ts
             if delta_time > 0:
-                cpu_percent = (delta_cpu / _CLK_TCK) / delta_time * 100.0
-        self._prev_utime = utime
-        self._prev_stime = stime
+                cpu_pct = (delta_cpu / _CLK_TCK) / delta_time * 100.0
+        self._prev_utime = total_utime
+        self._prev_stime = total_stime
         self._prev_ts = now
-        return now, cpu_percent, rss_kib
+        return now, cpu_pct, rss_kib
 
 
 def read_container_sample(container: str) -> tuple[float, float, int] | None:
@@ -988,6 +977,7 @@ def main() -> int:
             progress_stop = threading.Event()
             pagesize = os.sysconf(os.sysconf_names["SC_PAGESIZE"])
             prev = {"utime": 0, "stime": 0, "ts": 0.0}
+            cgroup_cache: dict[str, str | None] = {}
 
             def _log_progress() -> None:
                 while not progress_stop.is_set():
@@ -1009,24 +999,63 @@ def main() -> int:
                         cpid = pid_result.stdout.strip()
                         if not cpid or cpid == "0":
                             raise Exception("no container pid")
-                        with open(f"/proc/{cpid}/stat", "r") as f:
-                            content = f.read()
-                        close_paren = content.rfind(")")
-                        fields = content[close_paren + 2 :].split()
-                        utime = int(fields[11])
-                        stime = int(fields[12])
-                        rss_kib = (int(fields[21]) * pagesize) // 1024
+                        cache_key = f"{args.arroyo_container}"
+                        procs_path = cgroup_cache.get(cache_key, "")
+                        if not procs_path:
+                            try:
+                                with open(f"/proc/{cpid}/cgroup", "r") as f:
+                                    for line in f:
+                                        line = line.strip()
+                                        if ":name=systemd:" in line or line.startswith(
+                                            "0::"
+                                        ):
+                                            cg = line.split(":", 2)[-1]
+                                            pp = f"/sys/fs/cgroup{cg}/cgroup.procs"
+                                            if os.path.isfile(pp):
+                                                procs_path = pp
+                                                cgroup_cache[cache_key] = pp
+                                                break
+                            except Exception:
+                                pass
+                        if not procs_path:
+                            raise Exception("no cgroup procs")
+                        with open(procs_path, "r") as f:
+                            pids = [line.strip() for line in f if line.strip()]
+                        total_utime = 0
+                        total_stime = 0
+                        total_rss = 0
+                        for pid in pids:
+                            try:
+                                with open(f"/proc/{pid}/stat", "r") as f:
+                                    content = f.read()
+                            except Exception:
+                                continue
+                            close_paren = content.rfind(")")
+                            if close_paren < 0:
+                                continue
+                            fields = content[close_paren + 2 :].split()
+                            if len(fields) < 22:
+                                continue
+                            try:
+                                total_utime += int(fields[11])
+                                total_stime += int(fields[12])
+                                total_rss += int(fields[21])
+                            except (IndexError, ValueError):
+                                continue
+                        rss_kib = (total_rss * pagesize) // 1024
                         now = time.time()
                         cpu_pct = 0.0
                         if prev["ts"] > 0:
-                            delta = (utime - prev["utime"]) + (stime - prev["stime"])
+                            delta = (total_utime - prev["utime"]) + (
+                                total_stime - prev["stime"]
+                            )
                             dt = now - prev["ts"]
                             if dt > 0:
                                 cpu_pct = (delta / _CLK_TCK) / dt * 100.0
-                        prev["utime"] = utime
-                        prev["stime"] = stime
+                        prev["utime"] = total_utime
+                        prev["stime"] = total_stime
                         prev["ts"] = now
-                        log(f"CPU={cpu_pct:.1f}% RSS={rss_kib / 1024 / 1024:.2f} GiB")
+                        log(f"CPU={cpu_pct:.1f}% RES={rss_kib / 1024 / 1024:.2f} GiB")
                     except Exception:
                         pass
                     progress_stop.wait(1.0)
