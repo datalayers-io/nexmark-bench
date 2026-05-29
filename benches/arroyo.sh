@@ -140,7 +140,7 @@ if [[ -z "$bench_root" ]]; then
 	bench_root="$(mktemp -d "${TMPDIR:-/tmp}/nexmark-bench.XXXXXX")"
 fi
 work_dir="$bench_root/arroyo"
-run_id="$(basename "$bench_root" | tr -c '[:alnum:]' '-')"
+run_id="$(basename "$bench_root" | tr -c '[:alnum:]' '-' | tr -d '\n')"
 kafka_network="arroyo-nexmark-net-${run_id}"
 if [[ -n "$kafka_container_arg" ]]; then
 	if [[ "$(docker inspect -f '{{.State.Running}}' "$kafka_container_arg" 2>/dev/null)" != "true" ]]; then

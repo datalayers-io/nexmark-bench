@@ -574,57 +574,56 @@ def read_job_id_from_proc(proc: subprocess.Popen[str], timeout: int) -> str:
     )
 
 
-def kafka_group_lag(container: str, group: str, topic: str) -> int | None:
-    result = subprocess.run(
-        [
-            "docker",
-            "exec",
-            container,
-            "kafka-consumer-groups",
-            "--bootstrap-server",
-            "127.0.0.1:9092",
-            "--describe",
-            "--group",
-            group,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if result.returncode != 0:
-        return None
-    total = 0
-    seen = False
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) < 6 or fields[1] != topic:
-            continue
-        seen = True
-        lag_text = fields[-1]
-        if lag_text == "-":
-            continue
-        total += int(lag_text)
-    return total if seen else None
-
-
-def wait_for_group_lag_zero(
-    container: str, group: str, topic: str, timeout: int
+def wait_for_job_idle(
+    pids_supplier: Callable[[], list[int]],
+    timeout: int,
+    stable_sec: int = 8,
+    drop_ratio: float = 0.3,
+    min_busy_cpu: float = 30.0,
 ) -> None:
-    # For Flink we treat "source consumed all preloaded rows" as the end of the replay phase.
     start = time.time()
+    peak_cpu = 0.0
+    busy_seen = False
+    drop_time: float | None = None
     last_progress = start
-    last_lag: int | None = None
     while True:
-        lag = kafka_group_lag(container, group, topic)
-        if lag == 0:
-            return
-        if last_lag is None or lag != last_lag:
+        pids = pids_supplier()
+        if not pids:
+            if time.time() - last_progress > timeout:
+                raise BenchError("timeout waiting for Flink job: no processes found")
+            time.sleep(1)
+            continue
+        sample = read_process_sample(pids)
+        if sample is None:
+            time.sleep(1)
+            continue
+        cpu_pct = sample[1]
+        if cpu_pct >= min_busy_cpu:
+            if not busy_seen:
+                log(f"Flink job is busy (CPU={cpu_pct:.1f}%), waiting for idle...")
+            busy_seen = True
+            drop_time = None
             last_progress = time.time()
+        if cpu_pct > peak_cpu:
+            peak_cpu = cpu_pct
+        idle_threshold = peak_cpu * drop_ratio
+        if busy_seen and peak_cpu > 0 and cpu_pct < idle_threshold:
+            if drop_time is None:
+                drop_time = time.time()
+            elif time.time() - drop_time >= stable_sec:
+                log(
+                    f"Flink job became idle (CPU={cpu_pct:.1f}% < {idle_threshold:.1f}% for {stable_sec}s, peak={peak_cpu:.1f}%)",
+                    color=GREEN,
+                )
+                return
+        else:
+            if busy_seen:
+                drop_time = None
         if time.time() - last_progress > timeout:
             raise BenchError(
-                f"timeout waiting for kafka group {group} lag to reach 0 on topic {topic}"
+                f"timeout waiting for Flink job to become idle "
+                f"(current CPU={cpu_pct:.1f}%, peak={peak_cpu:.1f}%, busy_seen={busy_seen})"
             )
-        last_lag = lag
         time.sleep(1)
 
 
@@ -673,6 +672,29 @@ def flink_pids(runtime_flink: Path) -> list[int]:
             pids.append(int(pid_file.read_text(encoding="utf-8").strip()))
         except Exception:
             continue
+    if pids:
+        return pids
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                "for d in /proc/[0-9]*; do "
+                "grep -qs 'org.apache.flink' \"$d\"/cmdline 2>/dev/null && "
+                'echo "$(basename "$d")"; '
+                "done",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in result.stdout.strip().splitlines():
+            try:
+                pids.append(int(line.strip()))
+            except ValueError:
+                continue
+    except Exception:
+        pass
     return pids
 
 
@@ -901,8 +923,9 @@ def main() -> int:
                 log(f"Flink job submitted: {job_id}")
                 replay_t0 = time.time()
                 monitor.start()
-                wait_for_group_lag_zero(
-                    args.kafka_container, f"flink-{query.name}", topic, args.timeout
+                wait_for_job_idle(
+                    lambda: flink_pids(runtime_flink),
+                    args.timeout,
                 )
                 cancel_job(rest_port, job_id)
                 state = wait_for_job(rest_port, job_id, timeout=args.timeout)

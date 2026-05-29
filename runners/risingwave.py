@@ -292,6 +292,7 @@ def configure_benchmark_session(
     statements = [
         f"SET streaming_parallelism = {parallelism}",
         "SET streaming_use_snapshot_backfill = false",
+        "SET streaming_use_arrangement_backfill = false",
     ]
     sql.set_session_statements(statements)
     for index, statement in enumerate(statements):
@@ -835,9 +836,7 @@ def create_mv(sql: RisingWaveSql, mv: str, source: str, query: QuerySpec) -> Non
 def create_blackhole_sink(
     sql: RisingWaveSql, sink: str, source: str, query: QuerySpec, mv_backing: str
 ) -> None:
-    log(
-        f"Creating RisingWave intermediate MV {mv_backing} for blackhole sink {sink}"
-    )
+    log(f"Creating RisingWave intermediate MV {mv_backing} for blackhole sink {sink}")
     select_sql = query.select_sql.format(source=source)
     mv_text = f"""
         CREATE MATERIALIZED VIEW {mv_backing} AS
@@ -861,7 +860,11 @@ def create_blackhole_sink(
 
 
 def cleanup_objects(
-    sql: RisingWaveSql, target: str, source: str, sink_mode: SinkMode, mv_backing: str = ""
+    sql: RisingWaveSql,
+    target: str,
+    source: str,
+    sink_mode: SinkMode,
+    mv_backing: str = "",
 ) -> None:
     log(f"Cleaning up RisingWave objects source={source} target={target}")
     if sink_mode == SinkMode.TABLE:

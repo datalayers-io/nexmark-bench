@@ -312,6 +312,9 @@ class ArroyoApi:
         return json.loads(body.decode("utf-8"))
 
 
+_CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+
+
 class ContainerMonitor:
     def __init__(self, container: str, output_csv: Path, sample_interval: float):
         self.container = container
@@ -319,6 +322,10 @@ class ContainerMonitor:
         self.sample_interval = sample_interval
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._prev_utime: int | None = None
+        self._prev_stime: int | None = None
+        self._prev_ts: float | None = None
+        self._cgroup_procs_path: str | None = None
 
     def start(self) -> None:
         self.output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -335,11 +342,99 @@ class ContainerMonitor:
             writer = csv.writer(fh)
             writer.writerow(["ts_epoch", "cpu_percent", "rss_kib"])
             while not self._stop.is_set():
-                sample = read_container_sample(self.container)
+                sample = self._read_sample()
                 if sample is not None:
                     writer.writerow(sample)
                     fh.flush()
                 time.sleep(self.sample_interval)
+
+    def _resolve_cgroup(self, pid: str) -> None:
+        if self._cgroup_procs_path is not None:
+            return
+        try:
+            with open(f"/proc/{pid}/cgroup", "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if ":name=systemd:" in line or line.startswith("0::"):
+                        cgroup_path = line.split(":", 2)[-1]
+                        procs_path = f"/sys/fs/cgroup{cgroup_path}/cgroup.procs"
+                        if os.path.isfile(procs_path):
+                            self._cgroup_procs_path = procs_path
+                            return
+        except (FileNotFoundError, PermissionError):
+            pass
+
+    def _read_proc_stats(self) -> tuple[int, int, int] | None:
+        if self._cgroup_procs_path is None:
+            return None
+        pagesize = os.sysconf(os.sysconf_names["SC_PAGESIZE"])
+        total_utime = 0
+        total_stime = 0
+        total_rss = 0
+        try:
+            with open(self._cgroup_procs_path, "r") as f:
+                pids = [line.strip() for line in f if line.strip()]
+        except (FileNotFoundError, PermissionError):
+            return None
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/stat", "r") as f:
+                    content = f.read()
+            except (FileNotFoundError, PermissionError):
+                continue
+            close_paren = content.rfind(")")
+            if close_paren < 0:
+                continue
+            fields = content[close_paren + 2 :].split()
+            if len(fields) < 22:
+                continue
+            try:
+                total_utime += int(fields[11])
+                total_stime += int(fields[12])
+                total_rss += int(fields[21])
+            except (IndexError, ValueError):
+                continue
+        rss_kib = (total_rss * pagesize) // 1024
+        return total_utime, total_stime, rss_kib
+
+    def _get_pid(self) -> str | None:
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Pid}}", self.container],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        pid = result.stdout.strip()
+        if not pid or pid == "0":
+            return None
+        self._resolve_cgroup(pid)
+        return pid
+
+    def _read_sample(self) -> tuple[float, float, int] | None:
+        pid = self._get_pid()
+        if not pid:
+            return None
+        stat = self._read_proc_stats()
+        if stat is None:
+            return None
+        utime, stime, rss_kib = stat
+        now = time.time()
+        cpu_percent: float = 0.0
+        if (
+            self._prev_ts is not None
+            and self._prev_utime is not None
+            and self._prev_stime is not None
+        ):
+            delta_cpu = (utime - self._prev_utime) + (stime - self._prev_stime)
+            delta_time = now - self._prev_ts
+            if delta_time > 0:
+                cpu_percent = (delta_cpu / _CLK_TCK) / delta_time * 100.0
+        self._prev_utime = utime
+        self._prev_stime = stime
+        self._prev_ts = now
+        return now, cpu_percent, rss_kib
 
 
 def read_container_sample(container: str) -> tuple[float, float, int] | None:
@@ -404,7 +499,9 @@ def summarize_samples(path: Path) -> tuple[float, float]:
     return avg_cpu, avg_mem_gib
 
 
-def run_cmd(cmd: list[str], input_path: Path | None = None, timeout: int = 300) -> None:
+def run_cmd(
+    cmd: list[str], input_path: Path | None = None, timeout: int = 300
+) -> subprocess.CompletedProcess[str]:
     stdin = None
     try:
         if input_path is not None:
@@ -420,6 +517,7 @@ def run_cmd(cmd: list[str], input_path: Path | None = None, timeout: int = 300) 
                 or result.stdout.decode("utf-8", errors="ignore")
             ).strip()
         )
+    return result
 
 
 def ensure_topic(container: str, topic: str, partitions: int) -> None:
