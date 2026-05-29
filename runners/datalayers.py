@@ -1066,6 +1066,43 @@ def main() -> int:
             )
             replay_t0 = time.time()
             log(f"Starting replay window for query {query.name}")
+            progress_stop = threading.Event()
+            if args.engine_pid is not None:
+                log(f"Monitoring Datalayers PID: {args.engine_pid}")
+                pagesize = os.sysconf(os.sysconf_names["SC_PAGESIZE"])
+                prev = {"utime": 0, "stime": 0, "ts": 0.0}
+
+                def _log_progress() -> None:
+                    while not progress_stop.is_set():
+                        try:
+                            with open(f"/proc/{args.engine_pid}/stat", "r") as f:
+                                content = f.read()
+                            close_paren = content.rfind(")")
+                            fields = content[close_paren + 2 :].split()
+                            utime = int(fields[11])
+                            stime = int(fields[12])
+                            rss_kib = (int(fields[21]) * pagesize) // 1024
+                            now = time.time()
+                            cpu_pct = 0.0
+                            if prev["ts"] > 0:
+                                delta = (utime - prev["utime"]) + (
+                                    stime - prev["stime"]
+                                )
+                                dt = now - prev["ts"]
+                                if dt > 0:
+                                    cpu_pct = (delta / _CLK_TCK) / dt * 100.0
+                            prev["utime"] = utime
+                            prev["stime"] = stime
+                            prev["ts"] = now
+                            log(
+                                f"CPU={cpu_pct:.1f}% RSS={rss_kib / 1024 / 1024:.2f} GiB"
+                            )
+                        except Exception:
+                            pass
+                        progress_stop.wait(1.0)
+
+                progress_thread = threading.Thread(target=_log_progress, daemon=True)
+                progress_thread.start()
             if monitor is not None:
                 monitor.start()
             try:
@@ -1090,6 +1127,7 @@ def main() -> int:
                     )
                     inserted_rows = expected_rows
             finally:
+                progress_stop.set()
                 if monitor is not None:
                     monitor.stop()
             replay_t1 = time.time()

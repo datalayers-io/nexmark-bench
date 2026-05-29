@@ -983,7 +983,56 @@ def main() -> int:
                 )
             replay_t0 = time.time()
             log(f"Starting replay window for query {query.name}")
+            log(f"Monitoring Arroyo container: {args.arroyo_container}")
             monitor.start()
+            progress_stop = threading.Event()
+            pagesize = os.sysconf(os.sysconf_names["SC_PAGESIZE"])
+            prev = {"utime": 0, "stime": 0, "ts": 0.0}
+
+            def _log_progress() -> None:
+                while not progress_stop.is_set():
+                    try:
+                        pid_result = subprocess.run(
+                            [
+                                "docker",
+                                "inspect",
+                                "-f",
+                                "{{.State.Pid}}",
+                                args.arroyo_container,
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        if pid_result.returncode != 0:
+                            raise Exception("docker inspect failed")
+                        cpid = pid_result.stdout.strip()
+                        if not cpid or cpid == "0":
+                            raise Exception("no container pid")
+                        with open(f"/proc/{cpid}/stat", "r") as f:
+                            content = f.read()
+                        close_paren = content.rfind(")")
+                        fields = content[close_paren + 2 :].split()
+                        utime = int(fields[11])
+                        stime = int(fields[12])
+                        rss_kib = (int(fields[21]) * pagesize) // 1024
+                        now = time.time()
+                        cpu_pct = 0.0
+                        if prev["ts"] > 0:
+                            delta = (utime - prev["utime"]) + (stime - prev["stime"])
+                            dt = now - prev["ts"]
+                            if dt > 0:
+                                cpu_pct = (delta / _CLK_TCK) / dt * 100.0
+                        prev["utime"] = utime
+                        prev["stime"] = stime
+                        prev["ts"] = now
+                        log(f"CPU={cpu_pct:.1f}% RSS={rss_kib / 1024 / 1024:.2f} GiB")
+                    except Exception:
+                        pass
+                    progress_stop.wait(1.0)
+
+            progress_thread = threading.Thread(target=_log_progress, daemon=True)
+            progress_thread.start()
             try:
                 wait_for_group_lag_zero(
                     args.kafka_container, group, topic, args.timeout
@@ -993,6 +1042,7 @@ def main() -> int:
                 )
                 state = str(job["state"])
             finally:
+                progress_stop.set()
                 monitor.stop()
             replay_t1 = time.time()
             replay_sec = replay_t1 - replay_t0

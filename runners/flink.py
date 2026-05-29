@@ -574,57 +574,66 @@ def read_job_id_from_proc(proc: subprocess.Popen[str], timeout: int) -> str:
     )
 
 
-def wait_for_job_idle(
-    pids_supplier: Callable[[], list[int]],
-    timeout: int,
-    stable_sec: int = 8,
-    drop_ratio: float = 0.3,
-    min_busy_cpu: float = 30.0,
-) -> None:
+def source_read_records(rest_port: int, job_id: str) -> int:
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{rest_port}/jobs/{job_id}", timeout=5
+    ) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    vertices = payload.get("vertices", [])
+    if not vertices:
+        return 0
+    return int(vertices[0]["metrics"].get("read-records", 0))
+
+
+def wait_for_source_drain(
+    rest_port: int, job_id: str, expected_rows: int, timeout: int
+) -> float:
     start = time.time()
-    peak_cpu = 0.0
-    busy_seen = False
-    drop_time: float | None = None
     last_progress = start
+    last_count = 0
     while True:
-        pids = pids_supplier()
-        if not pids:
-            if time.time() - last_progress > timeout:
-                raise BenchError("timeout waiting for Flink job: no processes found")
-            time.sleep(1)
-            continue
-        sample = read_process_sample(pids)
-        if sample is None:
-            time.sleep(1)
-            continue
-        cpu_pct = sample[1]
-        if cpu_pct >= min_busy_cpu:
-            if not busy_seen:
-                log(f"Flink job is busy (CPU={cpu_pct:.1f}%), waiting for idle...")
-            busy_seen = True
-            drop_time = None
+        count = source_read_records(rest_port, job_id)
+        if count != last_count:
             last_progress = time.time()
-        if cpu_pct > peak_cpu:
-            peak_cpu = cpu_pct
-        idle_threshold = peak_cpu * drop_ratio
-        if busy_seen and peak_cpu > 0 and cpu_pct < idle_threshold:
-            if drop_time is None:
-                drop_time = time.time()
-            elif time.time() - drop_time >= stable_sec:
-                log(
-                    f"Flink job became idle (CPU={cpu_pct:.1f}% < {idle_threshold:.1f}% for {stable_sec}s, peak={peak_cpu:.1f}%)",
-                    color=GREEN,
-                )
-                return
-        else:
-            if busy_seen:
-                drop_time = None
+        if count >= expected_rows:
+            return last_progress
         if time.time() - last_progress > timeout:
             raise BenchError(
-                f"timeout waiting for Flink job to become idle "
-                f"(current CPU={cpu_pct:.1f}%, peak={peak_cpu:.1f}%, busy_seen={busy_seen})"
+                f"timeout waiting for source read-records {count}/{expected_rows}"
             )
+        last_count = count
+        log(
+            f"Source progress: read={count}/{expected_rows} records "
+            f"({count * 100.0 / expected_rows if expected_rows else 0:.1f}%)"
+        )
         time.sleep(1)
+
+
+def kill_leftover_flink_procs() -> None:
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                "for d in /proc/[0-9]*; do "
+                "grep -qs 'org.apache.flink' \"$d\"/cmdline 2>/dev/null && "
+                'echo "$(basename "$d")"; '
+                "done",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in result.stdout.strip().splitlines():
+            pid = line.strip()
+            if not pid:
+                continue
+            try:
+                os.kill(int(pid), 9)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def create_runtime(
@@ -868,6 +877,7 @@ def main() -> int:
     env["_JAVA_OPTIONS"] = FLINK_JAVA_OPTS
 
     try:
+        kill_leftover_flink_procs()
         run_cmd(
             [str(runtime_flink / "bin" / "start-cluster.sh")],
             cwd=runtime_flink,
@@ -923,8 +933,10 @@ def main() -> int:
                 log(f"Flink job submitted: {job_id}")
                 replay_t0 = time.time()
                 monitor.start()
-                wait_for_job_idle(
-                    lambda: flink_pids(runtime_flink),
+                replay_t1 = wait_for_source_drain(
+                    rest_port,
+                    job_id,
+                    total_rows,
                     args.timeout,
                 )
                 cancel_job(rest_port, job_id)
@@ -937,7 +949,7 @@ def main() -> int:
                     except Exception:
                         sql_proc.kill()
                 monitor.stop()
-            replay_sec = time.time() - replay_t0
+            replay_sec = replay_t1 - replay_t0
             avg_cpu_percent, avg_mem_gib = summarize_samples(sample_csv)
             log(
                 f"Finished benchmark for query {query.name}: state={state} replay_sec={replay_sec:.3f} "
