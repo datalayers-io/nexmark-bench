@@ -59,6 +59,12 @@ Usage:
       若匹配则跳过 preload 直接开始 benchmark。
       未传时会自动创建并启动一个新的 Kafka 容器。
 
+  --profile
+      使用 perf 采集 Datalayers 进程的 CPU profile，
+      并在 benchmark 结束后生成 flamegraph.svg。
+      要求 Datalayers 以以下方式编译：
+        RUSTFLAGS="-C force-frame-pointers" cargo build --profile reldev --bin datalayers
+
   --help
       显示本帮助信息。
 EOF
@@ -80,6 +86,7 @@ external_host="127.0.0.1"
 external_port="8361"
 timeout_sec="600"
 kafka_container_arg=""
+profile_mode=""
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -118,6 +125,10 @@ while [[ $# -gt 0 ]]; do
 	--kafka-container)
 		kafka_container_arg="$2"
 		shift 2
+		;;
+	--profile)
+		profile_mode="1"
+		shift
 		;;
 	--help)
 		usage
@@ -180,7 +191,7 @@ pre_cleanup() {
 	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
 }
 
-trap cleanup_services EXIT
+trap 'cleanup_profile; cleanup_services' EXIT
 
 wait_for_port() {
 	local host="$1"
@@ -206,6 +217,87 @@ find_free_port() {
 	done
 	echo "cannot find a free port in range $1-$2" >&2
 	exit 1
+}
+
+PROFILE_PERF_PID=""
+
+start_perf_profile() {
+	local pid="$1"
+	if ! command -v perf >/dev/null 2>&1; then
+		log "ERROR: 'perf' not found. Install linux-tools-common or perf package."
+		exit 1
+	fi
+	local perf_output="$work_dir/perf.data"
+	log "Starting perf record on PID $pid ..."
+	local perf_cmd="perf"
+	PROFILE_PERF_USE_SUDO=""
+	if ! perf record -o /dev/null -- sleep 1 2>/dev/null; then
+		if sudo -n true 2>/dev/null; then
+			perf_cmd="sudo perf"
+			PROFILE_PERF_USE_SUDO=1
+		else
+			log "ERROR: perf requires sudo or /proc/sys/kernel/perf_event_paranoid=-1"
+			exit 1
+		fi
+	fi
+	$perf_cmd record -p "$pid" -g --call-graph fp -F 49 -o "$perf_output" &
+	PROFILE_PERF_PID=$!
+	sleep 2
+	if ! kill -0 "$PROFILE_PERF_PID" 2>/dev/null; then
+		log "ERROR: perf record failed to start"
+		exit 1
+	fi
+	log "perf record started (pid $PROFILE_PERF_PID)"
+}
+
+stop_perf_profile() {
+	if [[ -z "${PROFILE_PERF_PID:-}" ]]; then
+		return
+	fi
+	log "Stopping perf record ..."
+	sudo kill -INT "$PROFILE_PERF_PID" 2>/dev/null || kill -INT "$PROFILE_PERF_PID" 2>/dev/null || true
+	wait "$PROFILE_PERF_PID" 2>/dev/null || true
+	PROFILE_PERF_PID=""
+
+	local perf_output="$work_dir/perf.data"
+	local flame_svg="$work_dir/flamegraph.svg"
+
+	if [[ "${PROFILE_PERF_USE_SUDO:-}" == "1" ]]; then
+		sudo chown "$(id -u):$(id -g)" "$perf_output" 2>/dev/null || true
+	fi
+	if [[ ! -f "$perf_output" ]]; then
+		log "WARNING: perf.data not found, skipping flamegraph generation"
+		return
+	fi
+	log "Generating flamegraph from $perf_output ..."
+	if command -v flamegraph >/dev/null 2>&1; then
+		flamegraph --perfdata "$perf_output" -o "$flame_svg" --no-inline
+	else
+		local fg_dir="$work_dir/FlameGraph"
+		if [[ ! -d "$fg_dir" ]]; then
+			log "Downloading FlameGraph scripts ..."
+			git clone --depth 1 https://github.com/brendangregg/FlameGraph.git "$fg_dir" 2>/dev/null || {
+				log "ERROR: Failed to clone FlameGraph. Install flamegraph-rs: cargo install flamegraph"
+				return
+			}
+		fi
+		perf script -i "$perf_output" | "$fg_dir/stackcollapse-perf.pl" | "$fg_dir/flamegraph.pl" >"$flame_svg" || {
+			log "ERROR: flamegraph generation failed"
+			return
+		}
+	fi
+	log "Flamegraph saved to $flame_svg"
+}
+
+cleanup_profile() {
+	if [[ -n "${PROFILE_PERF_PID:-}" ]]; then
+		sudo kill -INT "$PROFILE_PERF_PID" 2>/dev/null || kill -INT "$PROFILE_PERF_PID" 2>/dev/null || true
+		wait "$PROFILE_PERF_PID" 2>/dev/null || true
+		PROFILE_PERF_PID=""
+	fi
+	if [[ "${PROFILE_PERF_USE_SUDO:-}" == "1" ]] && [[ -f "$work_dir/perf.data" ]]; then
+		sudo chown "$(id -u):$(id -g)" "$work_dir/perf.data" 2>/dev/null || true
+	fi
 }
 
 prepare_workspace() {
@@ -304,13 +396,28 @@ if [[ -z "$kafka_container_arg" ]]; then
 	prepare_workspace
 	detect_engine_pid
 	start_kafka
-	run_bench
 else
 	prepare_workspace
 	detect_engine_pid
-	run_bench
+fi
+
+if [[ "$profile_mode" == "1" ]]; then
+	if [[ -z "$engine_pid" ]]; then
+		log "ERROR: --profile requires a detectable Datalayers PID. Is Datalayers running on port $external_port?"
+		exit 1
+	fi
+	start_perf_profile "$engine_pid"
+fi
+
+run_bench
+
+if [[ "$profile_mode" == "1" ]]; then
+	stop_perf_profile
 fi
 
 echo "report: $work_dir/report.md"
 echo "json:   $work_dir/report.json"
+if [[ "$profile_mode" == "1" ]]; then
+	echo "flame:  $work_dir/flamegraph.svg"
+fi
 echo "root:   $bench_root"

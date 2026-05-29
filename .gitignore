@@ -50,3 +50,6 @@ __pycache__
 # Generated Nexmark datasets and stats from datagen.sh.
 nexmark_bid*.jsonl
 nexmark_bid*.stats.json
+
+# Generated flamegraphs.
+*.svg

@@ -14,7 +14,7 @@ keyed bid JSONL dataset。当前 Flink runner 固定使用 blackhole sink。
    - 把 keyed dataset preload 到 topic
    - 启动本地 Flink standalone cluster
    - 创建 source/sink table 并提交 insert job
-   - 在 replay 窗口内采样 Flink 相关 Java 进程的 CPU 和 RSS
+   - 在 replay 窗口内采样 Flink 相关 Java 进程的 CPU 和 RSS，并每秒输出瞬时 CPU/MEM
    - 通过 Kafka consumer group lag 到 0 判定 source 已消费完输入
    - 主动 cancel 该 job 并收集结果
 4. 每个 query 的结果会写入 `report.md`、`report.json` 和采样 CSV。
@@ -22,11 +22,11 @@ keyed bid JSONL dataset。当前 Flink runner 固定使用 blackhole sink。
 当前统计的指标：
 
 - `replay_sec`
-  指从提交本轮 query 的 source/sink/insert job，到 lag 为 0 并结束 job 为止的耗时。
+  指从本轮 query job 进入 RUNNING 状态，到 Kafka consumer group lag 归零并 cancel job 为止的耗时。
 - `throughput_rps`
   定义为 `input_rows / replay_sec`。
 - `avg_cpu_percent`
-  replay 窗口内，对 Flink 相关 Java 进程做周期性 `ps` 采样后取平均值。
+  replay 窗口内，对 Flink 相关 Java 进程做周期性 `/proc/<pid>/stat` 采样后取平均值，与 `top` 口径一致。
 - `avg_mem_gib`
   replay 窗口内，对 Flink 相关 Java 进程 RSS 做周期性 `ps` 采样后取平均值，并换算为 GiB。
 - `kafka_preload_sec`
@@ -35,7 +35,7 @@ keyed bid JSONL dataset。当前 Flink runner 固定使用 blackhole sink。
 注意：
 
 - Flink SQL source 在当前这套实现里不是 bounded source，因此这里的“完成”是
-  `lag == 0` 之后再主动 cancel job，而不是等待 job 自然 FINISHED。
+  Kafka consumer group lag == 0 之后再主动 cancel job，而不是等待 job 自然 FINISHED。
 """
 
 from __future__ import annotations
@@ -64,6 +64,7 @@ from nexmark_fixture import load_bid_dataset_stats, prepare_flink_toolchain
 RESET = "\033[0m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
+_CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
 FLINK_JAVA_OPTS = (
     "--add-exports=java.base/sun.net.util=ALL-UNNAMED "
     "--add-opens=java.base/java.lang=ALL-UNNAMED "
@@ -574,39 +575,37 @@ def read_job_id_from_proc(proc: subprocess.Popen[str], timeout: int) -> str:
     )
 
 
-def source_read_records(rest_port: int, job_id: str) -> int:
+def job_info(rest_port: int, job_id: str) -> dict:
     with urllib.request.urlopen(
         f"http://127.0.0.1:{rest_port}/jobs/{job_id}", timeout=5
     ) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    vertices = payload.get("vertices", [])
-    if not vertices:
-        return 0
-    return int(vertices[0]["metrics"].get("read-records", 0))
+        return json.loads(resp.read().decode("utf-8"))
 
 
-def wait_for_source_drain(
-    rest_port: int, job_id: str, expected_rows: int, timeout: int
-) -> float:
-    start = time.time()
-    last_progress = start
-    last_count = 0
-    while True:
-        count = source_read_records(rest_port, job_id)
-        if count != last_count:
-            last_progress = time.time()
-        if count >= expected_rows:
-            return last_progress
-        if time.time() - last_progress > timeout:
-            raise BenchError(
-                f"timeout waiting for source read-records {count}/{expected_rows}"
-            )
-        last_count = count
-        log(
-            f"Source progress: read={count}/{expected_rows} records "
-            f"({count * 100.0 / expected_rows if expected_rows else 0:.1f}%)"
-        )
+def wait_for_job_running(rest_port: int, job_id: str, timeout: int) -> None:
+    log(f"Waiting for Flink job {job_id} to reach RUNNING state")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        info = job_info(rest_port, job_id)
+        state = str(info.get("state", ""))
+        vertices = info.get("vertices", [])
+        if state != "RUNNING" or not vertices:
+            time.sleep(1)
+            continue
+        running = True
+        for v in vertices:
+            s = str(v.get("status", "")).upper()
+            if s in ("CANCELING", "FAILED", "CANCELED"):
+                raise BenchError(
+                    f"Flink job vertex {v.get('name')} is {s} before job became RUNNING"
+                )
+            if s not in ("RUNNING", "FINISHED"):
+                running = False
+        if running:
+            log(f"Flink job {job_id} is RUNNING")
+            return
         time.sleep(1)
+    raise BenchError(f"timeout waiting for Flink job {job_id} to reach RUNNING")
 
 
 def kill_leftover_flink_procs() -> None:
@@ -707,12 +706,79 @@ def flink_pids(runtime_flink: Path) -> list[int]:
     return pids
 
 
+def kafka_group_offsets(
+    container: str, group: str, topic: str
+) -> list[tuple[int, int, int]]:
+    result = subprocess.run(
+        [
+            "docker",
+            "exec",
+            container,
+            "kafka-consumer-groups",
+            "--bootstrap-server",
+            "127.0.0.1:9092",
+            "--describe",
+            "--group",
+            group,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return []
+    rows: list[tuple[int, int, int]] = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 6 or fields[1] != topic:
+            continue
+        current_offset, log_end_offset, lag_value = fields[3], fields[4], fields[5]
+        if current_offset == "-" or log_end_offset == "-" or lag_value == "-":
+            continue
+        try:
+            rows.append((int(current_offset), int(log_end_offset), int(lag_value)))
+        except ValueError:
+            continue
+    return rows
+
+
+def wait_for_group_lag_zero(
+    container: str, group: str, topic: str, timeout: int
+) -> None:
+    log(f"Waiting for Kafka group `{group}` to finish consuming topic `{topic}`")
+    start = time.time()
+    last_progress = start
+    stable_polls = 0
+    last_lag: int | None = None
+    while True:
+        rows = kafka_group_offsets(container, group, topic)
+        if rows:
+            if all(
+                current + lag == end and lag in (0, 1) for current, end, lag in rows
+            ):
+                stable_polls += 1
+                if stable_polls >= 3:
+                    return
+            else:
+                stable_polls = 0
+        total_lag = sum(lag for _, _, lag in rows) if rows else 0
+        if last_lag is None or total_lag != last_lag:
+            last_progress = time.time()
+        if time.time() - last_progress > timeout:
+            raise BenchError(
+                f"timeout waiting for kafka group `{group}` to drain topic `{topic}`, current={rows}"
+            )
+        last_lag = total_lag
+        time.sleep(1)
+
+
 def render_sql(topic: str, query: QuerySpec, kafka_port: int) -> str:
     source = f"bid_src_{query.name}"
     sink = f"discard_sink_{query.name}"
     return (
         f"""
 SET 'execution.runtime-mode' = 'streaming';
+SET 'execution.checkpointing.interval' = '5s';
 DROP TABLE IF EXISTS {source};
 DROP TABLE IF EXISTS {sink};
 CREATE TABLE {source} (
@@ -931,16 +997,74 @@ def main() -> int:
                 )
                 job_id = read_job_id_from_proc(sql_proc, 120)
                 log(f"Flink job submitted: {job_id}")
+                wait_for_job_running(rest_port, job_id, args.timeout)
                 replay_t0 = time.time()
+                log(f"Starting replay window for query {query.name}")
+                log(f"Monitoring Flink processes")
                 monitor.start()
-                replay_t1 = wait_for_source_drain(
-                    rest_port,
-                    job_id,
-                    total_rows,
-                    args.timeout,
-                )
-                cancel_job(rest_port, job_id)
-                state = wait_for_job(rest_port, job_id, timeout=args.timeout)
+                progress_stop = threading.Event()
+                pagesize = os.sysconf(os.sysconf_names["SC_PAGESIZE"])
+                prev = {"utime": 0, "stime": 0, "ts": 0.0}
+
+                def _log_progress() -> None:
+                    while not progress_stop.is_set():
+                        try:
+                            pids = flink_pids(runtime_flink)
+                            total_utime = 0
+                            total_stime = 0
+                            total_rss = 0
+                            for pid in pids:
+                                try:
+                                    with open(f"/proc/{pid}/stat", "r") as f:
+                                        content = f.read()
+                                except (FileNotFoundError, PermissionError):
+                                    continue
+                                close_paren = content.rfind(")")
+                                if close_paren < 0:
+                                    continue
+                                fields = content[close_paren + 2 :].split()
+                                if len(fields) < 22:
+                                    continue
+                                try:
+                                    total_utime += int(fields[11])
+                                    total_stime += int(fields[12])
+                                    total_rss += int(fields[21])
+                                except (IndexError, ValueError):
+                                    continue
+                            if total_rss == 0:
+                                continue
+                            rss_kib = (total_rss * pagesize) // 1024
+                            now = time.time()
+                            cpu_pct = 0.0
+                            if prev["ts"] > 0:
+                                delta = (total_utime - prev["utime"]) + (
+                                    total_stime - prev["stime"]
+                                )
+                                dt = now - prev["ts"]
+                                if dt > 0:
+                                    cpu_pct = (delta / _CLK_TCK) / dt * 100.0
+                            prev["utime"] = total_utime
+                            prev["stime"] = total_stime
+                            prev["ts"] = now
+                            log(
+                                f"CPU={cpu_pct:.1f}% RES={rss_kib / 1024 / 1024:.2f} GiB"
+                            )
+                        except Exception:
+                            pass
+                        progress_stop.wait(1.0)
+
+                progress_thread = threading.Thread(target=_log_progress, daemon=True)
+                progress_thread.start()
+                try:
+                    group = f"flink-{query.name}"
+                    wait_for_group_lag_zero(
+                        args.kafka_container, group, topic, args.timeout
+                    )
+                    cancel_job(rest_port, job_id)
+                    state = wait_for_job(rest_port, job_id, timeout=args.timeout)
+                finally:
+                    progress_stop.set()
+                replay_t1 = time.time()
             finally:
                 if sql_proc is not None:
                     try:
