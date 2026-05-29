@@ -113,7 +113,7 @@ while [[ $# -gt 0 ]]; do
 		rw_image="$2"
 		shift 2
 		;;
-	-h | 	--help)
+	-h | --help)
 		usage
 		exit 0
 		;;

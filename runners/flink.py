@@ -449,10 +449,17 @@ def count_kafka_messages(container: str, topic: str) -> int | None:
     try:
         result = run_cmd(
             [
-                "docker", "exec", container,
-                "kafka-run-class", "kafka.tools.GetOffsetShell",
-                "--bootstrap-server", "127.0.0.1:9092",
-                "--topic", topic, "--time", "-1",
+                "docker",
+                "exec",
+                container,
+                "kafka-run-class",
+                "kafka.tools.GetOffsetShell",
+                "--bootstrap-server",
+                "127.0.0.1:9092",
+                "--topic",
+                topic,
+                "--time",
+                "-1",
             ],
             timeout=30,
         )
@@ -857,9 +864,13 @@ def main() -> int:
                 kafka_preload_sec = 0.0
             else:
                 if existing is not None:
-                    log(f"Topic {topic} has {existing} messages (expected {total_rows}), will reload")
+                    log(
+                        f"Topic {topic} has {existing} messages (expected {total_rows}), will reload"
+                    )
                 ensure_topic(args.kafka_container, topic, topic_partitions)
-                kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
+                kafka_preload_sec = load_topic(
+                    args.kafka_container, topic, dataset_path
+                )
             sql_file = workdir / f"{query.name}.sql"
             sql_text = render_sql(topic, query, args.kafka_port)
             log_sql(
