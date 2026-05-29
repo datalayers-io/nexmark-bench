@@ -14,6 +14,7 @@ usage() {
 Usage:
   risingwave.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22,q16,q17] [--parallelism N] [--sink table|blackhole]
                       [--bench-root DIR] [--timeout SEC] [--no-cleanup] [--image IMAGE]
+                      [--kafka-container KAFKA_CONTAINER]
 
 参数:
   --dataset PATH
@@ -49,6 +50,13 @@ Usage:
   --image IMAGE
       覆盖默认的 RisingWave 镜像。
 
+  --kafka-container KAFKA_CONTAINER
+      复用已有的 Kafka 容器。
+      传入一个正在运行的 Docker 容器名。
+      runner 会检查 topic 中已有 message 数量是否与 dataset 行数匹配，
+      若匹配则跳过 preload 直接开始 benchmark。
+      未传时会自动创建并启动一个新的 Kafka 容器。
+
   --help
       显示本帮助信息。
 EOF
@@ -69,6 +77,7 @@ bench_root=""
 rw_image="${RISINGWAVE_IMAGE:-risingwavelabs/risingwave:v2.8.3}"
 dataset="$project_root/nexmark_bid.keyed.jsonl"
 timeout_sec="600"
+kafka_container_arg=""
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -104,9 +113,13 @@ while [[ $# -gt 0 ]]; do
 		rw_image="$2"
 		shift 2
 		;;
-	-h | --help)
+	-h | 	--help)
 		usage
 		exit 0
+		;;
+	--kafka-container)
+		kafka_container_arg="$2"
+		shift 2
 		;;
 	*)
 		echo "unknown argument: $1" >&2
@@ -132,23 +145,42 @@ risingwave_store_dir="$work_dir/risingwave-store"
 rw_config_path="$work_dir/risingwave-bench.toml"
 run_id="$(basename "$bench_root" | tr -c '[:alnum:]' '-')"
 kafka_network="risingwave-nexmark-net-${run_id}"
-kafka_container="risingwave-nexmark-kafka-${run_id}"
+if [[ -n "$kafka_container_arg" ]]; then
+	if [[ "$(docker inspect -f '{{.State.Running}}' "$kafka_container_arg" 2>/dev/null)" != "true" ]]; then
+		echo "Kafka container $kafka_container_arg is not running" >&2
+		exit 1
+	fi
+	kafka_container="$kafka_container_arg"
+	kafka_host_port=$(docker port "$kafka_container" 29092 2>/dev/null | head -1 | cut -d: -f2)
+	if [[ -z "$kafka_host_port" ]]; then
+		echo "Cannot detect Kafka port on container $kafka_container" >&2
+		exit 1
+	fi
+	kafka_container_user="1"
+else
+	kafka_container="risingwave-nexmark-kafka-${run_id}"
+	kafka_host_port=""
+	kafka_container_user=""
+fi
 rw_container="risingwave-nexmark-standalone-${run_id}"
 rw_host_port=""
-kafka_host_port=""
 
 cleanup_services() {
 	if [[ "$no_cleanup" == "1" ]]; then
 		return
 	fi
 	docker rm -f "$rw_container" >/dev/null 2>&1 || true
-	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+	if [[ -z "$kafka_container_user" ]]; then
+		docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+	fi
 	docker network rm "$kafka_network" >/dev/null 2>&1 || true
 }
 
 pre_cleanup() {
 	docker rm -f "$rw_container" >/dev/null 2>&1 || true
-	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+	if [[ -z "$kafka_container_user" ]]; then
+		docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+	fi
 	docker network rm "$kafka_network" >/dev/null 2>&1 || true
 }
 
@@ -291,11 +323,17 @@ run_bench() {
 	log "RisingWave Nexmark benchmark finished"
 }
 
+if [[ -z "$kafka_container_arg" ]]; then
+	kafka_host_port="$(find_free_port 9092 9192)"
+fi
 prepare_workspace
 rw_host_port="$(find_free_port 4567 4667)"
-kafka_host_port="$(find_free_port 9092 9192)"
 ensure_network
-start_kafka
+if [[ -z "$kafka_container_arg" ]]; then
+	start_kafka
+else
+	docker network connect --alias kafka "$kafka_network" "$kafka_container" 2>/dev/null || true
+fi
 start_risingwave
 wait_for_risingwave_kafka_connectivity
 run_bench

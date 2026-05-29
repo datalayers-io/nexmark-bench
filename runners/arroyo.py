@@ -465,6 +465,26 @@ def ensure_topic(container: str, topic: str, partitions: int) -> None:
     )
 
 
+def count_kafka_messages(container: str, topic: str) -> int | None:
+    try:
+        result = run_cmd(
+            [
+                "docker", "exec", container,
+                "kafka-run-class", "kafka.tools.GetOffsetShell",
+                "--bootstrap-server", "127.0.0.1:9092",
+                "--topic", topic, "--time", "-1",
+            ],
+            timeout=30,
+        )
+        total = 0
+        for line in result.stdout.strip().splitlines():
+            if line:
+                total += int(line.rsplit(":", 1)[-1])
+        return total
+    except Exception:
+        return None
+
+
 def load_topic(container: str, topic: str, dataset_path: Path) -> float:
     log(f"Starting Kafka preload for topic {topic} from {dataset_path}")
     start = time.time()
@@ -531,7 +551,9 @@ def wait_for_group_lag_zero(
 ) -> None:
     log(f"Waiting for Kafka group `{group}` to finish consuming topic `{topic}`")
     start = time.time()
+    last_progress = start
     stable_polls = 0
+    last_lag: int | None = None
     while True:
         rows = kafka_group_offsets(container, group, topic)
         if rows:
@@ -546,10 +568,14 @@ def wait_for_group_lag_zero(
                     return
             else:
                 stable_polls = 0
-        if time.time() - start > timeout:
+        total_lag = sum(lag for _, _, lag in rows) if rows else 0
+        if last_lag is None or total_lag != last_lag:
+            last_progress = time.time()
+        if time.time() - last_progress > timeout:
             raise BenchError(
                 f"timeout waiting for kafka group `{group}` to drain topic `{topic}`, current={rows}"
             )
+        last_lag = total_lag
         time.sleep(1)
 
 
@@ -805,9 +831,17 @@ def main() -> int:
         sink = f"{query.name}_{'bh' if sink_mode == 'blackhole' else 'tbl'}_{suffix}"
         group = f"nexmark-arroyo-{query.name}-{suffix}"
         pipeline_name = f"nexmark_{query.name}_{suffix}"
-        ensure_topic(args.kafka_container, topic, topic_partitions)
-        try:
+        total_rows = dataset_stats["total_rows"]
+        existing = count_kafka_messages(args.kafka_container, topic)
+        if existing is not None and existing == total_rows:
+            log(f"Topic {topic} already has {existing} messages, skipping preload")
+            kafka_preload_sec = 0.0
+        else:
+            if existing is not None:
+                log(f"Topic {topic} has {existing} messages (expected {total_rows}), will reload")
+            ensure_topic(args.kafka_container, topic, topic_partitions)
             kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
+        try:
             expected_rows = query.expected_rows(dataset_stats)
             sql = render_sql(
                 topic, query, source, sink, args.kafka_brokers, group, sink_mode

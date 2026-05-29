@@ -14,7 +14,7 @@ usage() {
 Usage:
   arroyo.sh [--dataset PATH] [--queries q0,q1,q2,q14,q21,q22,q16,q17]
                   [--parallelism N] [--bench-root DIR] [--timeout SEC] [--no-cleanup] [--image IMAGE]
-                  [--sink table|blackhole]
+                  [--sink table|blackhole] [--kafka-container KAFKA_CONTAINER]
 
 参数:
   --dataset PATH
@@ -49,6 +49,13 @@ Usage:
       `blackhole` 写入 blackhole sink，数据直接丢弃。
       默认: blackhole
 
+  --kafka-container KAFKA_CONTAINER
+      复用已有的 Kafka 容器。
+      传入一个正在运行的 Docker 容器名。
+      runner 会检查 topic 中已有 message 数量是否与 dataset 行数匹配，
+      若匹配则跳过 preload 直接开始 benchmark。
+      未传时会自动创建并启动一个新的 Kafka 容器。
+
   --help
       显示本帮助信息。
 EOF
@@ -69,6 +76,7 @@ dataset="$project_root/nexmark_bid.keyed.jsonl"
 parallelism="1"
 sink="blackhole"
 timeout_sec="600"
+kafka_container_arg=""
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -104,6 +112,10 @@ while [[ $# -gt 0 ]]; do
 		sink="$2"
 		shift 2
 		;;
+	--kafka-container)
+		kafka_container_arg="$2"
+		shift 2
+		;;
 	-h | --help)
 		usage
 		exit 0
@@ -130,7 +142,23 @@ fi
 work_dir="$bench_root/arroyo"
 run_id="$(basename "$bench_root" | tr -c '[:alnum:]' '-')"
 kafka_network="arroyo-nexmark-net-${run_id}"
-kafka_container="arroyo-nexmark-kafka-${run_id}"
+if [[ -n "$kafka_container_arg" ]]; then
+	if [[ "$(docker inspect -f '{{.State.Running}}' "$kafka_container_arg" 2>/dev/null)" != "true" ]]; then
+		echo "Kafka container $kafka_container_arg is not running" >&2
+		exit 1
+	fi
+	kafka_container="$kafka_container_arg"
+	kafka_host_port=$(docker port "$kafka_container" 29092 2>/dev/null | head -1 | cut -d: -f2)
+	if [[ -z "$kafka_host_port" ]]; then
+		echo "Cannot detect Kafka port on container $kafka_container" >&2
+		exit 1
+	fi
+	kafka_container_user="1"
+else
+	kafka_container="arroyo-nexmark-kafka-${run_id}"
+	kafka_host_port=""
+	kafka_container_user=""
+fi
 arroyo_container="arroyo-nexmark-${run_id}"
 arroyo_host_port=""
 kafka_host_port=""
@@ -140,13 +168,17 @@ cleanup_services() {
 		return
 	fi
 	docker rm -f "$arroyo_container" >/dev/null 2>&1 || true
-	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+	if [[ -z "$kafka_container_user" ]]; then
+		docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+	fi
 	docker network rm "$kafka_network" >/dev/null 2>&1 || true
 }
 
 pre_cleanup() {
 	docker rm -f "$arroyo_container" >/dev/null 2>&1 || true
-	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+	if [[ -z "$kafka_container_user" ]]; then
+		docker rm -f "$kafka_container" >/dev/null 2>&1 || true
+	fi
 	docker network rm "$kafka_network" >/dev/null 2>&1 || true
 }
 
@@ -266,11 +298,17 @@ run_bench() {
 	log "Arroyo Nexmark benchmark finished"
 }
 
+if [[ -z "$kafka_container_arg" ]]; then
+	kafka_host_port="$(find_free_port 9092 9192)"
+fi
 arroyo_host_port="$(find_free_port 5115 5215)"
-kafka_host_port="$(find_free_port 9092 9192)"
 prepare_workspace
 ensure_network
-start_kafka
+if [[ -z "$kafka_container_arg" ]]; then
+	start_kafka
+else
+	docker network connect --alias kafka "$kafka_network" "$kafka_container" 2>/dev/null || true
+fi
 start_arroyo
 run_bench
 

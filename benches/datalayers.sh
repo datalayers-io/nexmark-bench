@@ -15,6 +15,7 @@ Usage:
   datalayers.sh [--host HOST] [--port HTTP_PORT] [--dataset PATH]
                       [--queries q0,q1,q2,q14,q21,q22,q16,q17] [--sink table|blackhole]
                       [--bench-root DIR] [--timeout SEC] [--no-cleanup]
+                      [--kafka-container KAFKA_CONTAINER]
 
 参数:
   -h, --host HOST
@@ -51,6 +52,13 @@ Usage:
       保留 Kafka 容器以及 benchmark 创建的 database/source/pipeline/sink/table 等对象。
       未传时会在 bench 结束后执行 cleanup。
 
+  --kafka-container KAFKA_CONTAINER
+      复用已有的 Kafka 容器。
+      传入一个正在运行的 Docker 容器名。
+      runner 会检查 topic 中已有 message 数量是否与 dataset 行数匹配，
+      若匹配则跳过 preload 直接开始 benchmark。
+      未传时会自动创建并启动一个新的 Kafka 容器。
+
   --help
       显示本帮助信息。
 EOF
@@ -71,6 +79,7 @@ dataset="$project_root/nexmark_bid.keyed.jsonl"
 external_host="127.0.0.1"
 external_port="8361"
 timeout_sec="600"
+kafka_container_arg=""
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -106,6 +115,10 @@ while [[ $# -gt 0 ]]; do
 		no_cleanup="1"
 		shift
 		;;
+	--kafka-container)
+		kafka_container_arg="$2"
+		shift 2
+		;;
 	--help)
 		usage
 		exit 0
@@ -131,18 +144,39 @@ if [[ -z "$bench_root" ]]; then
 fi
 work_dir="$bench_root/datalayers"
 run_id="$(basename "$bench_root" | tr -c '[:alnum:]' '-')"
-kafka_container="datalayers-nexmark-kafka-${run_id}"
-kafka_host_port=""
+if [[ -n "$kafka_container_arg" ]]; then
+	if [[ "$(docker inspect -f '{{.State.Running}}' "$kafka_container_arg" 2>/dev/null)" != "true" ]]; then
+		echo "Kafka container $kafka_container_arg is not running" >&2
+		exit 1
+	fi
+	kafka_container="$kafka_container_arg"
+	kafka_host_port=$(docker port "$kafka_container" 29092 2>/dev/null | head -1 | cut -d: -f2)
+	if [[ -z "$kafka_host_port" ]]; then
+		echo "Cannot detect Kafka port on container $kafka_container" >&2
+		exit 1
+	fi
+	kafka_container_user="1"
+else
+	kafka_container="datalayers-nexmark-kafka-${run_id}"
+	kafka_host_port=""
+	kafka_container_user=""
+fi
 engine_pid=""
 
 cleanup_services() {
 	if [[ "$no_cleanup" == "1" ]]; then
 		return
 	fi
+	if [[ -n "$kafka_container_user" ]]; then
+		return
+	fi
 	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
 }
 
 pre_cleanup() {
+	if [[ -n "$kafka_container_user" ]]; then
+		return
+	fi
 	docker rm -f "$kafka_container" >/dev/null 2>&1 || true
 }
 
@@ -191,6 +225,15 @@ detect_engine_pid() {
 	fi
 	if [[ -z "$pid" ]]; then
 		pid="$(ss -ltnp "( sport = :$external_port )" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1 || true)"
+	fi
+	if [[ -z "$pid" ]] && command -v pgrep >/dev/null 2>&1; then
+		pid="$(ps -ef 2>/dev/null | awk '$8 ~ /(^|\/)datalayers$/ && $0 ~ / standalone( |$)/ {pid=$2} END {print pid}' || true)"
+	fi
+	if [[ -z "$pid" ]] && command -v pgrep >/dev/null 2>&1; then
+		pid="$(pgrep -x datalayers | tail -n 1 || true)"
+	fi
+	if [[ -z "$pid" ]]; then
+		pid="$(ps -ef 2>/dev/null | awk '/\/datalayers standalone/ && $8 !~ /sudo$/ && $2 ~ /^[0-9]+$/ {pid=$2} END {print pid}' || true)"
 	fi
 	if [[ -n "$pid" ]]; then
 		log "Detected Datalayers listener PID $pid on port $external_port"
@@ -256,11 +299,17 @@ run_bench() {
 	log "Datalayers Nexmark benchmark finished"
 }
 
-kafka_host_port="$(find_free_port 9092 9192)"
-prepare_workspace
-detect_engine_pid
-start_kafka
-run_bench
+if [[ -z "$kafka_container_arg" ]]; then
+	kafka_host_port="$(find_free_port 9092 9192)"
+	prepare_workspace
+	detect_engine_pid
+	start_kafka
+	run_bench
+else
+	prepare_workspace
+	detect_engine_pid
+	run_bench
+fi
 
 echo "report: $work_dir/report.md"
 echo "json:   $work_dir/report.json"

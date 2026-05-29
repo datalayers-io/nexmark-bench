@@ -450,6 +450,26 @@ def ensure_topic(container: str, topic: str, partitions: int) -> None:
     )
 
 
+def count_kafka_messages(container: str, topic: str) -> int | None:
+    try:
+        result = run_cmd(
+            [
+                "docker", "exec", container,
+                "kafka-run-class", "kafka.tools.GetOffsetShell",
+                "--bootstrap-server", "127.0.0.1:9092",
+                "--topic", topic, "--time", "-1",
+            ],
+            timeout=30,
+        )
+        total = 0
+        for line in result.stdout.strip().splitlines():
+            if line:
+                total += int(line.rsplit(":", 1)[-1])
+        return total
+    except Exception:
+        return None
+
+
 def load_topic(container: str, topic: str, dataset_path: Path) -> float:
     log(f"Starting Kafka preload for topic {topic} from {dataset_path}")
     start = time.time()
@@ -492,16 +512,23 @@ def wait_for_count(
         f"and Kafka group `{group}` lag to reach 0"
     )
     start = time.time()
+    last_progress = start
+    last_count: int | None = None
+    last_lag: int | None = None
     while True:
         count = sql.scalar_i64(f"SELECT COUNT(*) AS c FROM {table}", database)
         lag = kafka_group_lag(container, group, topic)
         if count >= expected_rows and lag == 0:
             return count, time.time() - start
-        if time.time() - start > timeout:
+        if last_count is None or count != last_count or lag != last_lag:
+            last_progress = time.time()
+        if time.time() - last_progress > timeout:
             raise BenchError(
                 f"timeout waiting for {table} count>={expected_rows} and kafka lag=0, "
                 f"current_count={count} current_lag={lag}"
             )
+        last_count = count
+        last_lag = lag
         time.sleep(1)
 
 
@@ -548,14 +575,19 @@ def wait_for_group_lag_zero(
 ) -> tuple[int, float]:
     # Blackhole sink completion is approximated by Kafka consumer lag reaching zero.
     start = time.time()
+    last_progress = start
+    last_lag: int | None = None
     while True:
         lag = kafka_group_lag(container, group, topic)
         if lag == 0:
             return 0, time.time() - start
-        if time.time() - start > timeout:
+        if last_lag is None or lag != last_lag:
+            last_progress = time.time()
+        if time.time() - last_progress > timeout:
             raise BenchError(
                 f"timeout waiting for kafka group `{group}` lag to reach 0 on topic `{topic}`, current={lag}"
             )
+        last_lag = lag
         time.sleep(1)
 
 
@@ -913,7 +945,16 @@ def main() -> int:
         log(f"Starting benchmark for query {query.name}", color=GREEN)
         topic = f"nexmark_{query.name}"
         database = f"nexmark_{query.name}"
-        ensure_topic(args.kafka_container, topic, topic_partitions)
+        total_rows = dataset_stats["total_rows"]
+        existing = count_kafka_messages(args.kafka_container, topic)
+        if existing is not None and existing == total_rows:
+            log(f"Topic {topic} already has {existing} messages, skipping preload")
+            kafka_preload_sec = 0.0
+        else:
+            if existing is not None:
+                log(f"Topic {topic} has {existing} messages (expected {total_rows}), will reload")
+            ensure_topic(args.kafka_container, topic, topic_partitions)
+            kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
         source = ""
         sink = ""
         pipeline = ""
@@ -923,7 +964,6 @@ def main() -> int:
                 sink = create_table_sink(sql, database, query)
             else:
                 sink = create_blackhole_sink(sql, database, query)
-            kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
             expected_rows = query.expected_rows(dataset_stats)
             sample_csv = workdir / f"{query.name}_samples.csv"
             monitor = (

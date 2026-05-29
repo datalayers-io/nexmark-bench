@@ -435,6 +435,26 @@ def ensure_topic(container: str, topic: str, partitions: int) -> None:
     )
 
 
+def count_kafka_messages(container: str, topic: str) -> int | None:
+    try:
+        result = run_cmd(
+            [
+                "docker", "exec", container,
+                "kafka-run-class", "kafka.tools.GetOffsetShell",
+                "--bootstrap-server", "127.0.0.1:9092",
+                "--topic", topic, "--time", "-1",
+            ],
+            timeout=30,
+        )
+        total = 0
+        for line in result.stdout.strip().splitlines():
+            if line:
+                total += int(line.rsplit(":", 1)[-1])
+        return total
+    except Exception:
+        return None
+
+
 def load_topic(container: str, topic: str, dataset_path: Path) -> float:
     log(f"Starting Kafka preload for topic {topic} from {dataset_path}")
     start = time.time()
@@ -476,8 +496,10 @@ def wait_for_count(
         f"and Kafka group `{group}` to finish consuming topic `{topic}`"
     )
     start = time.time()
+    last_progress = start
     stable_count_polls = 0
     previous_count: int | None = None
+    last_lag: int | None = None
     fallback_logged = False
     while True:
         count = sql.scalar_i64(f"SELECT COUNT(*) FROM {table}")
@@ -501,11 +523,16 @@ def wait_for_count(
         else:
             stable_count_polls = 0
             previous_count = count
-        if time.time() - start > timeout:
+        # Compute total lag for progress detection
+        total_lag = sum(lag for _, _, lag in rows) if rows else 0
+        if last_lag is None or count != previous_count or total_lag != last_lag:
+            last_progress = time.time()
+        if time.time() - last_progress > timeout:
             raise BenchError(
                 f"timeout waiting for {table} count>={expected_rows} and kafka group to drain, "
                 f"current_count={count} current_offsets={rows}"
             )
+        last_lag = total_lag
         time.sleep(1)
 
 
@@ -563,7 +590,9 @@ def wait_for_group_lag_zero(
 ) -> None:
     log(f"Waiting for Kafka group `{group}` to finish consuming topic `{topic}`")
     start = time.time()
+    last_progress = start
     stable_polls = 0
+    last_lag: int | None = None
     while True:
         drained, rows = kafka_group_drained(container, group, topic)
         if drained:
@@ -572,10 +601,14 @@ def wait_for_group_lag_zero(
                 return
         else:
             stable_polls = 0
-        if time.time() - start > timeout:
+        total_lag = sum(lag for _, _, lag in rows) if rows else 0
+        if last_lag is None or total_lag != last_lag:
+            last_progress = time.time()
+        if time.time() - last_progress > timeout:
             raise BenchError(
                 f"timeout waiting for kafka group `{group}` to drain topic `{topic}`, current={rows}"
             )
+        last_lag = total_lag
         time.sleep(1)
 
 
@@ -695,8 +728,10 @@ def wait_for_sink_input_rows(
         f"via RisingWave metric `{RW_METRIC_NAME}`"
     )
     start = time.time()
+    last_progress = start
     stable_polls = 0
     last_count: int | None = None
+    last_lag: int | None = None
     drained_polls = 0
     metric_fallback_logged = False
     while True:
@@ -725,11 +760,15 @@ def wait_for_sink_input_rows(
                 return expected_rows
         else:
             drained_polls = 0
-        if time.time() - start > timeout:
+        total_lag = sum(lag for _, _, lag in rows) if rows else 0
+        if last_lag is None or count != last_count or total_lag != last_lag:
+            last_progress = time.time()
+        if time.time() - last_progress > timeout:
             raise BenchError(
                 f"timeout waiting for sink {sink_name} metric rows>={expected_rows}, "
                 f"current={count} kafka_offsets={rows}"
             )
+        last_lag = total_lag
         time.sleep(1)
 
 
@@ -1001,11 +1040,22 @@ def main() -> int:
         target = (
             f"{query.name}_mv" if sink_mode == SinkMode.TABLE else f"{query.name}_bh"
         )
-        ensure_topic(args.kafka_container, topic, topic_partitions)
+        total_rows = dataset_stats["total_rows"]
+        existing = count_kafka_messages(args.kafka_container, topic)
+        skip_preload = existing is not None and existing == total_rows
+        if skip_preload:
+            log(f"Topic {topic} already has {existing} messages, skipping preload")
+        else:
+            if existing is not None:
+                log(f"Topic {topic} has {existing} messages (expected {total_rows}), will reload")
+            ensure_topic(args.kafka_container, topic, topic_partitions)
         if not args.no_cleanup:
             cleanup_objects(sql, target, source, sink_mode)
         try:
-            kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
+            if skip_preload:
+                kafka_preload_sec = 0.0
+            else:
+                kafka_preload_sec = load_topic(args.kafka_container, topic, dataset_path)
             expected_rows = query.expected_rows(dataset_stats)
             sample_csv = workdir / f"{query.name}_samples.csv"
             monitor = ContainerMonitor(
